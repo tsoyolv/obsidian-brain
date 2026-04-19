@@ -1,0 +1,58 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+  background-color: #0b0d10;
+  color: #e6edf3;
+  font-feature-settings: "ss01", "cv01";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background-color: rgba(124, 92, 255, 0.4);
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg
+           px-3 py-2 text-sm font-medium transition
+           border border-bg-border bg-bg-elevated text-ink
+           hover:bg-bg-panel disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-accent border-accent text-white hover:bg-accent-muted;
+  }
+  .btn-ghost {
+    @apply btn bg-transparent border-transparent hover:bg-bg-elevated;
+  }
+  .input,
+  .textarea {
+    @apply w-full rounded-lg border border-bg-border bg-bg-elevated
+           px-3 py-2 text-sm text-ink placeholder:text-ink-dim
+           outline-none focus:border-accent focus:ring-1 focus:ring-accent/40;
+  }
+  .card {
+    @apply rounded-xl border border-bg-border bg-bg-panel p-4;
+  }
+  .pill {
+    @apply inline-flex items-center rounded-full border border-bg-border
+           bg-bg-elevated px-2 py-0.5 text-xs text-ink-muted;
+  }
+}
+
+/* Subtle pulsing dot used for "recording" state. */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.4; transform: scale(0.8); }
+}
+.recording-dot {
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}

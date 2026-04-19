@@ -1,0 +1,15 @@
+export {
+  VAULT_FOLDERS,
+  DELETED_FOLDER,
+  getVaultService,
+  _resetVaultServiceCache,
+  type VaultService,
+  type VaultFolder,
+  type CreateNoteInput,
+  type CreateNoteResult,
+  type ParsedNote,
+  type SearchOptions,
+  type MoveFileOptions,
+  type MoveFileResult,
+  type SoftDeleteResult,
+} from "./vaultService";
