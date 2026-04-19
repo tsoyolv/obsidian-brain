@@ -13,5 +13,6 @@ export {
   type MoveFileResult,
   type SoftDeleteResult,
   type FileMatch,
+  type FileStat,
   type FindFilesOptions,
 } from "./vaultService";

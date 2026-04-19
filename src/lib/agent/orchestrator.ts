@@ -1,0 +1,985 @@
+import { llmProviderFactory } from "@/lib/providers/llm";
+import type {
+  ChatInput,
+  LLMMessage,
+  ToolDescriptor,
+} from "@/lib/providers/llm";
+import { createLogger } from "@/lib/utils/logger";
+import { newId } from "@/lib/utils/id";
+import {
+  getAgentSessionStore,
+  PENDING_CONFIRMATION_TTL_MS,
+} from "./session";
+import { listTools, getTool } from "./tools";
+import type {
+  AgentMessage,
+  AgentTool,
+  AnyAgentTool,
+  PendingConfirmation,
+  ToolCtx,
+  ToolResult,
+} from "./types";
+import { zodToJsonSchema } from "./zodToJsonSchema";
+
+const log = createLogger("agentOrchestrator");
+
+/**
+ * Maximum number of tool calls (successful, errored, or invalid-args) the
+ * orchestrator will let the model make in a single turn before forcing a
+ * final summary. Keeps runaway loops bounded; the design doc caps this at
+ * 4.
+ */
+const MAX_TOOL_CALLS_PER_TURN = 4;
+
+/**
+ * On invalid LLM-supplied tool arguments we feed the validation error back
+ * to the model so it can self-correct. We allow exactly one such retry per
+ * turn to avoid pingpong; after that, the orchestrator gives up and
+ * surfaces a final apology message.
+ */
+const MAX_INVALID_ARGS_RETRIES = 1;
+
+const SYSTEM_PROMPT = [
+  "You are an agent for the user's personal Obsidian-backed brain.",
+  "",
+  "Hard safety rules — NEVER violate these:",
+  "  * You MUST go through the provided tools for any vault interaction.",
+  "  * You NEVER read the full body of a vault file without explicit user",
+  "    confirmation. Use `propose_open_file` to surface candidates first;",
+  "    `read_confirmed_file` and `run_file_task` will be gated for confirmation.",
+  "  * You NEVER hard-delete files. `soft_delete` only.",
+  "  * You NEVER set the `confirmationToken` parameter on any tool — the",
+  "    orchestrator injects it after the user explicitly approves.",
+  "",
+  "You may chain MULTIPLE tool calls in one turn (e.g. find_file →",
+  "propose_open_file). When you have everything you need, stop calling tools",
+  "and reply to the user in plain text with a short, helpful summary.",
+].join("\n");
+
+// ---- Public event shape ----
+
+/**
+ * One event emitted by {@link runTurn} as the agent loop progresses.
+ *
+ *   - `tool_call`           — model dispatched a tool; args are validated
+ *   - `tool_result`         — tool finished (or failed); `result.ok` tells
+ *                             which. Pairs with the previous `tool_call`
+ *                             via `callId`.
+ *   - `message_delta`       — incremental assistant text from the model
+ *   - `needs_confirmation`  — model called a confirmation-gated tool; the
+ *                             action did NOT run. The caller surfaces a
+ *                             confirm/cancel UI and resumes via {@link
+ *                             confirmTurn} OR via a natural-language
+ *                             follow-up that the orchestrator's pre-loop
+ *                             matches against `pendingConfirmation`.
+ *   - `final`               — terminal frame; the loop is done. `message`
+ *                             is the assistant's final text reply (may be
+ *                             empty if the loop exhausted its budget).
+ */
+export type AgentEvent =
+  | {
+      type: "tool_call";
+      callId: string;
+      name: string;
+      args: unknown;
+    }
+  | {
+      type: "tool_result";
+      callId: string;
+      name: string;
+      result: ToolResult<unknown>;
+    }
+  | { type: "message_delta"; text: string }
+  | {
+      type: "needs_confirmation";
+      token: string;
+      toolName: string;
+      args: unknown;
+      preview: unknown;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      candidates?: any[];
+    }
+  | { type: "final"; message: string };
+
+// ---- runTurn ----
+
+export interface PriorContext {
+  /**
+   * Pre-built rolling-history snapshot to seed the agent session with
+   * before this turn runs. When supplied, completely replaces the
+   * session's existing `messages` (the chat layer owns its own
+   * compaction window and is the authoritative source). When omitted,
+   * the session's existing rolling history is used as-is.
+   */
+  history?: AgentMessage[];
+  /**
+   * Free-form text appended to the orchestrator's system prompt for this
+   * turn only. Chat sessions inject their rolling summary here so the
+   * model has gist-of-everything context without the chat layer needing
+   * to teach the orchestrator about ChatSession internals.
+   */
+  systemSuffix?: string;
+}
+
+export interface RunTurnInput {
+  sessionId: string;
+  userText: string;
+  /**
+   * Optional injected context from a higher layer (chat). When set, the
+   * agent session's rolling history is replaced before this turn runs
+   * and `priorContext.systemSuffix` is folded into the system prompt.
+   * Capture flows leave this undefined and rely on the agent session's
+   * own ROLLING_HISTORY_LIMIT-bounded history.
+   */
+  priorContext?: PriorContext;
+}
+
+/**
+ * Drive ONE conversational turn against the agent for a given session, as
+ * an async generator of {@link AgentEvent} frames.
+ *
+ * Pipeline:
+ *   1. discard any expired/stale pending confirmation
+ *   2. if a pending confirmation is alive AND the user input matches a
+ *      yes/no/ordinal cue → resolve WITHOUT calling the LLM
+ *   3. otherwise: append the user message and enter the iterative loop:
+ *      - send transcript + tool registry to the LLM
+ *        (with a system note about any still-pending confirmation)
+ *      - if the LLM emits text only, finalize and return
+ *      - if the LLM emits a tool call:
+ *          * validate args (one retry on validation failure)
+ *          * if `needsConfirmation` fires → stash pending confirmation,
+ *            yield `needs_confirmation` (with candidates if any), and stop
+ *          * otherwise execute the tool, append `tool_call` + `tool_result`
+ *            to the session, and loop
+ *      - cap at {@link MAX_TOOL_CALLS_PER_TURN} tool calls per turn; on
+ *        overflow, ask the model for a final no-tool summary and yield it
+ *   4. mark any still-unresolved pending as having seen its grace turn
+ */
+export async function* runTurn(
+  input: RunTurnInput
+): AsyncGenerator<AgentEvent, void, void> {
+  const sessions = getAgentSessionStore();
+  const session = sessions.ensure(input.sessionId);
+
+  const userText = input.userText.trim();
+  if (!userText) {
+    yield { type: "final", message: "Empty user input." };
+    return;
+  }
+
+  // (0) Chat-layer hand-off: when priorContext.history is supplied, the
+  // chat service is the authoritative owner of conversational history
+  // (it has its own rolling-summary compactor). Replace the agent
+  // session's rolling history with the chat's tail so the LLM prompt
+  // matches what the chat would have built on its own. Pending
+  // confirmation is preserved across the swap so the gated-tool flow
+  // still works inside chats.
+  if (input.priorContext?.history !== undefined) {
+    sessions.replaceMessages(session.id, input.priorContext.history);
+  }
+  const systemSuffix = input.priorContext?.systemSuffix;
+
+  // (1) Drop pending if it has expired or already had its grace turn. We
+  // do this BEFORE matching so a stale yes/no can't accidentally trigger
+  // an old action.
+  discardStalePending(session.id);
+  const pendingAtStart = sessions.get(session.id)?.pendingConfirmation;
+
+  // (2) Try to resolve a live pending from the user's natural-language
+  // input. Affirmative / negative / ordinal cues short-circuit the LLM.
+  if (pendingAtStart) {
+    const intent = parseUserIntent(userText, pendingAtStart.candidates);
+    if (intent.kind !== "none") {
+      sessions.appendMessage(session.id, { role: "user", content: userText });
+      yield* resolveFromPending(session.id, pendingAtStart, intent);
+      return;
+    }
+  }
+
+  sessions.appendMessage(session.id, { role: "user", content: userText });
+
+  const t = log.time("runTurn");
+  log.debug("runTurn: start", {
+    sessionId: session.id,
+    historyLen: session.messages.length,
+    hasPending: Boolean(pendingAtStart),
+  });
+
+  yield* iterativeLoop(session.id, pendingAtStart, systemSuffix);
+
+  // (4) If the pending we entered with is STILL there at end-of-turn, it
+  // got injected as context but was neither matched nor consumed. Mark it
+  // so the next turn discards it.
+  const after = sessions.get(session.id)?.pendingConfirmation;
+  if (after && pendingAtStart && after.token === pendingAtStart.token) {
+    sessions.markPendingStale(session.id);
+  }
+
+  t.done("runTurn", {
+    sessionId: session.id,
+    historyLen: sessions.get(session.id)?.messages.length ?? 0,
+  });
+}
+
+// ---- confirmTurn ----
+
+export interface ConfirmTurnInput {
+  sessionId: string;
+  /** Token previously surfaced via a `needs_confirmation` event. */
+  token: string;
+}
+
+/**
+ * Resume an interrupted turn after the user explicitly confirms the
+ * pending tool call (button-driven path; the natural-language path is
+ * handled inline by {@link runTurn}'s pre-loop).
+ *
+ * Behaviour:
+ *   - looks up the session's `pendingConfirmation` and matches the token
+ *   - runs the gated tool with the orchestrator-injected token; the tool
+ *     atomically verifies + consumes the pending record from the store
+ *     (so a concurrent attempt can't re-use it)
+ *   - appends `tool_call` + `tool_result` to the session
+ *   - re-enters the iterative loop so the model can react to the result
+ *
+ * If the token doesn't match (or no pending confirmation exists), yields a
+ * single `final` event explaining the mismatch and returns.
+ */
+export async function* confirmTurn(
+  input: ConfirmTurnInput & { priorContext?: PriorContext }
+): AsyncGenerator<AgentEvent, void, void> {
+  const sessions = getAgentSessionStore();
+  const session = sessions.ensure(input.sessionId);
+  // Same chat-layer hand-off as runTurn: the chat service may be re-
+  // seeding the session with its compacted tail before the confirm.
+  if (input.priorContext?.history !== undefined) {
+    sessions.replaceMessages(session.id, input.priorContext.history);
+  }
+  const systemSuffix = input.priorContext?.systemSuffix;
+  const pending = session.pendingConfirmation;
+
+  if (!pending || pending.token !== input.token) {
+    log.warn("confirmTurn: no matching pending confirmation", {
+      sessionId: session.id,
+      hasPending: Boolean(pending),
+    });
+    yield {
+      type: "final",
+      message:
+        "No matching pending confirmation — it may have expired or already been handled.",
+    };
+    return;
+  }
+
+  const tool = getTool(pending.toolName);
+  if (!tool) {
+    sessions.setPendingConfirmation(session.id, undefined);
+    log.warn("confirmTurn: pending tool unknown", { name: pending.toolName });
+    yield {
+      type: "final",
+      message: `Pending tool "${pending.toolName}" is no longer available.`,
+    };
+    return;
+  }
+
+  const t = log.time("confirmTurn");
+  log.debug("confirmTurn: start", {
+    sessionId: session.id,
+    tool: tool.name,
+  });
+
+  // The gated tool's `run` consumes the pending record atomically via the
+  // session store; we don't pre-clear here so a failure before `run` can
+  // be retried.
+  const argsWithToken = injectConfirmationToken(pending.args, pending.token);
+  yield* runToolAndYield(session.id, tool, argsWithToken);
+  yield* iterativeLoop(session.id, undefined, systemSuffix);
+
+  t.done("confirmTurn", {
+    sessionId: session.id,
+    tool: tool.name,
+  });
+}
+
+// ---- iterative loop ----
+
+async function* iterativeLoop(
+  sessionId: string,
+  pendingContext?: PendingConfirmation,
+  systemSuffix?: string
+): AsyncGenerator<AgentEvent, void, void> {
+  const sessions = getAgentSessionStore();
+  const llm = llmProviderFactory.get();
+  const tools = listTools();
+  const descriptors: ToolDescriptor[] = tools.map((t) => toDescriptor(t));
+
+  let toolCallsUsed = countToolCallsInSession(
+    sessions.get(sessionId)?.messages ?? []
+  );
+  let invalidArgsRetries = 0;
+
+  while (true) {
+    if (toolCallsUsed >= MAX_TOOL_CALLS_PER_TURN) {
+      // Budget exhausted — ask the model for a no-tools summary and stop.
+      const summary = await finalSummary(sessionId, pendingContext, systemSuffix);
+      yield { type: "final", message: summary };
+      return;
+    }
+
+    const session = sessions.get(sessionId)!;
+    // Re-read pending each iteration: it may have been consumed by a tool
+    // we just ran, or replaced by a new gated call.
+    const livePending = session.pendingConfirmation ?? pendingContext;
+    const chatInput: ChatInput = {
+      temperature: 0.2,
+      messages: buildPromptMessages(session.messages, livePending, systemSuffix),
+    };
+
+    let assistantText = "";
+    let toolCall: { name: string; args: unknown } | undefined;
+    for await (const frame of llm.chatWithTools(chatInput, descriptors)) {
+      if (frame.type === "message_delta" && frame.delta) {
+        assistantText += frame.delta;
+        yield { type: "message_delta", text: frame.delta };
+      } else if (frame.type === "tool_call" && frame.toolCall && !toolCall) {
+        toolCall = frame.toolCall;
+      }
+    }
+
+    // Path A — pure text reply. End the loop.
+    if (!toolCall) {
+      const text = assistantText.trim();
+      if (text) {
+        sessions.appendMessage(sessionId, {
+          role: "assistant",
+          content: text,
+        });
+      }
+      yield { type: "final", message: text || "(no response)" };
+      return;
+    }
+
+    // Path B — tool dispatch.
+    toolCallsUsed += 1;
+
+    const tool = getTool(toolCall.name);
+    if (!tool) {
+      const callId = newId("call");
+      sessions.appendMessage(sessionId, {
+        role: "tool_call",
+        id: callId,
+        toolName: toolCall.name,
+        args: toolCall.args,
+      });
+      const errResult: ToolResult<unknown> = {
+        ok: false,
+        error: `Unknown tool "${toolCall.name}".`,
+      };
+      sessions.appendMessage(sessionId, {
+        role: "tool_result",
+        id: callId,
+        toolName: toolCall.name,
+        result: errResult,
+      });
+      yield {
+        type: "tool_call",
+        callId,
+        name: toolCall.name,
+        args: toolCall.args,
+      };
+      yield {
+        type: "tool_result",
+        callId,
+        name: toolCall.name,
+        result: errResult,
+      };
+      // Let the model react to the error on the next loop iteration.
+      continue;
+    }
+
+    // Strip any model-supplied `confirmationToken` BEFORE validation so a
+    // hallucinated value can never bypass the confirmation flow. Real
+    // tokens are only ever orchestrator-injected.
+    const sanitizedArgs = stripConfirmationToken(toolCall.args);
+
+    // Validate args BEFORE checking `needsConfirmation` so confirmation
+    // previews always reflect parsed (not raw-JSON) input.
+    const parsed = tool.parameters.safeParse(sanitizedArgs);
+    if (!parsed.success) {
+      const issues = parsed.error.issues
+        .map((i) => `${i.path.join(".")}: ${i.message}`)
+        .join("; ");
+      const callId = newId("call");
+      sessions.appendMessage(sessionId, {
+        role: "tool_call",
+        id: callId,
+        toolName: tool.name,
+        args: sanitizedArgs,
+      });
+      const errResult: ToolResult<unknown> = {
+        ok: false,
+        error: `Invalid arguments for ${tool.name}: ${issues}`,
+      };
+      sessions.appendMessage(sessionId, {
+        role: "tool_result",
+        id: callId,
+        toolName: tool.name,
+        result: errResult,
+      });
+      yield {
+        type: "tool_call",
+        callId,
+        name: tool.name,
+        args: sanitizedArgs,
+      };
+      yield {
+        type: "tool_result",
+        callId,
+        name: tool.name,
+        result: errResult,
+      };
+
+      log.warn("iterativeLoop: tool args validation failed", {
+        tool: tool.name,
+        issues,
+        retry: invalidArgsRetries,
+      });
+
+      invalidArgsRetries += 1;
+      if (invalidArgsRetries > MAX_INVALID_ARGS_RETRIES) {
+        const summary = await finalSummary(sessionId, livePending, systemSuffix);
+        yield {
+          type: "final",
+          message:
+            summary ||
+            `Couldn't construct valid arguments for ${tool.name} — giving up this turn.`,
+        };
+        return;
+      }
+      continue;
+    }
+    const validatedArgs = parsed.data;
+
+    const needs = tool.needsConfirmation?.(validatedArgs);
+    if (needs === true || needs === "always") {
+      const token = newId("conf");
+      const candidates = findLatestCandidates(
+        sessions.get(sessionId)?.messages ?? []
+      );
+      const now = new Date();
+      const pending: PendingConfirmation = {
+        token,
+        toolName: tool.name,
+        args: validatedArgs,
+        candidates,
+        createdAt: now.toISOString(),
+        expiresAt: new Date(
+          now.getTime() + PENDING_CONFIRMATION_TTL_MS
+        ).toISOString(),
+      };
+      sessions.setPendingConfirmation(sessionId, pending);
+      log.info("iterativeLoop: needs confirmation", {
+        sessionId,
+        tool: tool.name,
+        token,
+        candidates: candidates?.length ?? 0,
+      });
+      yield {
+        type: "needs_confirmation",
+        token,
+        toolName: tool.name,
+        args: validatedArgs,
+        preview: validatedArgs,
+        candidates,
+      };
+      // Stop the loop; resumption happens via confirmTurn OR via a
+      // natural-language follow-up handled by runTurn's pre-loop.
+      return;
+    }
+
+    yield* runToolAndYield(sessionId, tool, validatedArgs);
+    // Loop again so the model can react to the tool result.
+  }
+}
+
+// ---- pending-confirmation resolution ----
+
+type UserIntent =
+  | { kind: "affirmative"; index?: number }
+  | { kind: "negative" }
+  | { kind: "none" };
+
+/**
+ * Run a tool against an existing pending confirmation, after the user has
+ * implicitly approved via a natural-language follow-up ("yes" / "the
+ * second one" / etc). Mirrors {@link confirmTurn}'s body but skips token
+ * generation since the pending already has one.
+ */
+async function* resolveFromPending(
+  sessionId: string,
+  pending: PendingConfirmation,
+  intent: UserIntent
+): AsyncGenerator<AgentEvent, void, void> {
+  const sessions = getAgentSessionStore();
+
+  if (intent.kind === "negative") {
+    sessions.setPendingConfirmation(sessionId, undefined);
+    log.info("resolveFromPending: cancelled", {
+      sessionId,
+      tool: pending.toolName,
+    });
+    const message = `Cancelled — ${pending.toolName} will not run.`;
+    sessions.appendMessage(sessionId, { role: "assistant", content: message });
+    yield { type: "final", message };
+    return;
+  }
+
+  // Defensive — runTurn only routes here for affirmative / negative.
+  if (intent.kind !== "affirmative") return;
+
+  // Affirmative — possibly with an ordinal selector.
+  const tool = getTool(pending.toolName);
+  if (!tool) {
+    sessions.setPendingConfirmation(sessionId, undefined);
+    log.warn("resolveFromPending: tool gone", { name: pending.toolName });
+    yield {
+      type: "final",
+      message: `Pending tool "${pending.toolName}" is no longer available.`,
+    };
+    return;
+  }
+
+  let args = pending.args;
+  if (intent.index !== undefined) {
+    const candidates = pending.candidates ?? [];
+    const picked = candidates[intent.index - 1];
+    if (!picked) {
+      sessions.setPendingConfirmation(sessionId, undefined);
+      const msg = `No candidate at position ${intent.index} — there were only ${candidates.length}.`;
+      sessions.appendMessage(sessionId, { role: "assistant", content: msg });
+      yield { type: "final", message: msg };
+      return;
+    }
+    const path = typeof picked === "object" && picked && "path" in picked
+      ? (picked as { path: string }).path
+      : undefined;
+    if (!path) {
+      sessions.setPendingConfirmation(sessionId, undefined);
+      const msg = `Candidate ${intent.index} is missing a usable path; please retry.`;
+      sessions.appendMessage(sessionId, { role: "assistant", content: msg });
+      yield { type: "final", message: msg };
+      return;
+    }
+    args = rebindArgsToPath(args, path);
+    log.info("resolveFromPending: ordinal rebind", {
+      sessionId,
+      tool: tool.name,
+      index: intent.index,
+      path,
+    });
+  } else {
+    log.info("resolveFromPending: affirmative", {
+      sessionId,
+      tool: tool.name,
+    });
+  }
+
+  const argsWithToken = injectConfirmationToken(args, pending.token);
+  yield* runToolAndYield(sessionId, tool, argsWithToken);
+  yield* iterativeLoop(sessionId);
+}
+
+/**
+ * Tokenise the user input and decide whether it represents a confirmation
+ * decision against the current pending. Returns `{kind: "none"}` for
+ * anything we don't recognise — the caller falls back to the LLM.
+ *
+ * Recognised patterns:
+ *   - affirmative: "yes" / "yeah" / "yep" / "sure" / "ok" / "okay" /
+ *                  "open it" / "do it" / "go" / "go ahead" / "confirm" /
+ *                  "proceed"
+ *   - negative:    "no" / "nope" / "cancel" / "skip" / "stop" / "abort" /
+ *                  "don't" / "do not"
+ *   - ordinal (only when `candidates` is a non-empty array):
+ *       "#N" / "the Nth" / "Nth one" / "first / second / third / …"
+ *       Extracted from anywhere in the input; treated as affirmative+index.
+ */
+function parseUserIntent(
+  input: string,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  candidates: any[] | undefined
+): UserIntent {
+  const text = input.trim().toLowerCase().replace(/[.!?]+$/, "");
+  if (!text) return { kind: "none" };
+
+  // Ordinal extraction first — a phrase like "yes, the second one" should
+  // resolve to affirmative+index, not bare affirmative.
+  if (Array.isArray(candidates) && candidates.length > 0) {
+    const idx = extractOrdinal(text);
+    if (idx !== undefined) {
+      return { kind: "affirmative", index: idx };
+    }
+  }
+
+  if (NEGATIVE_PHRASES.has(text) || NEGATIVE_PREFIXES.some((p) => text.startsWith(p))) {
+    return { kind: "negative" };
+  }
+  if (AFFIRMATIVE_PHRASES.has(text) || AFFIRMATIVE_PREFIXES.some((p) => text.startsWith(p))) {
+    return { kind: "affirmative" };
+  }
+
+  return { kind: "none" };
+}
+
+const AFFIRMATIVE_PHRASES = new Set([
+  "yes",
+  "yeah",
+  "yep",
+  "yup",
+  "sure",
+  "ok",
+  "okay",
+  "go",
+  "go ahead",
+  "confirm",
+  "confirmed",
+  "proceed",
+  "do it",
+  "open it",
+  "open",
+  "y",
+]);
+const AFFIRMATIVE_PREFIXES = ["yes ", "ok ", "okay ", "sure ", "go ahead ", "confirm "];
+
+const NEGATIVE_PHRASES = new Set([
+  "no",
+  "nope",
+  "nah",
+  "cancel",
+  "skip",
+  "stop",
+  "abort",
+  "don't",
+  "dont",
+  "do not",
+  "n",
+]);
+const NEGATIVE_PREFIXES = ["no ", "cancel ", "skip ", "stop ", "abort "];
+
+const ORDINAL_WORDS: Record<string, number> = {
+  first: 1,
+  second: 2,
+  third: 3,
+  fourth: 4,
+  fifth: 5,
+  sixth: 6,
+  seventh: 7,
+  eighth: 8,
+  ninth: 9,
+  tenth: 10,
+};
+
+function extractOrdinal(text: string): number | undefined {
+  // "#N" anywhere
+  const hash = text.match(/#\s*(\d{1,2})\b/);
+  if (hash) return parseIntSafe(hash[1]!);
+  // "the Nth" / "Nth" / "N-th" — match digit forms 1st / 2nd / 3rd / 4th…
+  const digitOrdinal = text.match(/\b(\d{1,2})(?:st|nd|rd|th)\b/);
+  if (digitOrdinal) return parseIntSafe(digitOrdinal[1]!);
+  // "number N" / "option N"
+  const labelled = text.match(/\b(?:number|option|item|candidate)\s+(\d{1,2})\b/);
+  if (labelled) return parseIntSafe(labelled[1]!);
+  // Word ordinals — only when paired with an affirmative cue OR "one" /
+  // "the X" so a stray "second" in unrelated prose doesn't trigger.
+  for (const [word, value] of Object.entries(ORDINAL_WORDS)) {
+    const re = new RegExp(`\\b(?:the\\s+)?${word}(?:\\s+one)?\\b`);
+    if (re.test(text)) return value;
+  }
+  return undefined;
+}
+
+function parseIntSafe(s: string): number | undefined {
+  const n = Number.parseInt(s, 10);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * Walk the session backwards looking for the most recent successful
+ * `propose_open_file` (or `find_file`) result and return its candidate
+ * list. Used to attach `candidates` to a fresh `pendingConfirmation` so
+ * "the second one" works on the next turn.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function findLatestCandidates(messages: AgentMessage[]): any[] | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.role !== "tool_result") continue;
+    if (m.toolName !== "propose_open_file" && m.toolName !== "find_file") {
+      continue;
+    }
+    const result = m.result as ToolResult<unknown> | undefined;
+    if (!result || !result.ok) continue;
+    const data = (result as { ok: true; data: unknown }).data;
+    if (data && typeof data === "object") {
+      // propose_open_file → { candidates: FileCandidate[] }
+      // find_file        → { matches:    FileMatch[] }
+      const obj = data as Record<string, unknown>;
+      const arr = (obj.candidates ?? obj.matches) as unknown;
+      if (Array.isArray(arr) && arr.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return arr as any[];
+      }
+    }
+  }
+  return undefined;
+}
+
+function rebindArgsToPath(args: unknown, path: string): unknown {
+  if (!args || typeof args !== "object") return { path };
+  return { ...(args as Record<string, unknown>), path };
+}
+
+function injectConfirmationToken(args: unknown, token: string): unknown {
+  if (!args || typeof args !== "object") {
+    return { confirmationToken: token };
+  }
+  return { ...(args as Record<string, unknown>), confirmationToken: token };
+}
+
+function stripConfirmationToken(args: unknown): unknown {
+  if (!args || typeof args !== "object") return args;
+  const obj = args as Record<string, unknown>;
+  if (!("confirmationToken" in obj)) return args;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { confirmationToken: _drop, ...rest } = obj;
+  return rest;
+}
+
+function discardStalePending(sessionId: string): void {
+  const sessions = getAgentSessionStore();
+  const session = sessions.get(sessionId);
+  const pending = session?.pendingConfirmation;
+  if (!pending) return;
+  const expired = Date.parse(pending.expiresAt) < Date.now();
+  if (expired || pending.staleAfterTurn) {
+    log.info("runTurn: discarding stale pending", {
+      sessionId,
+      tool: pending.toolName,
+      reason: expired ? "expired" : "graceTurnElapsed",
+    });
+    sessions.setPendingConfirmation(sessionId, undefined);
+  }
+}
+
+// ---- helpers ----
+
+/**
+ * Run a tool, append `tool_call` + `tool_result` to the session, and yield
+ * the matching events to the caller.
+ *
+ * Tool failures are surfaced as `{ ok: false, error }` (not thrown) so the
+ * loop stays responsive and the model gets a chance to recover.
+ */
+async function* runToolAndYield(
+  sessionId: string,
+  tool: AnyAgentTool,
+  args: unknown
+): AsyncGenerator<AgentEvent, void, void> {
+  const sessions = getAgentSessionStore();
+  const callId = newId("call");
+  sessions.appendMessage(sessionId, {
+    role: "tool_call",
+    id: callId,
+    toolName: tool.name,
+    args,
+  });
+  yield { type: "tool_call", callId, name: tool.name, args };
+
+  const ctx: ToolCtx = {
+    sessionId,
+    logger: createLogger(`agent.tool.${tool.name}`),
+  };
+
+  let result: ToolResult<unknown>;
+  try {
+    const data = await runToolUnknown(tool, args, ctx);
+    result = { ok: true, data };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    log.warn("runToolAndYield: tool execution failed", {
+      tool: tool.name,
+      err: errMsg,
+    });
+    result = { ok: false, error: errMsg };
+  }
+
+  sessions.appendMessage(sessionId, {
+    role: "tool_result",
+    id: callId,
+    toolName: tool.name,
+    result,
+  });
+  yield { type: "tool_result", callId, name: tool.name, result };
+}
+
+/**
+ * Ask the model for a no-tools summary based on the current transcript.
+ * Used when we hit the per-turn tool-call cap, or when we've burned the
+ * invalid-args retry budget — the goal is to never leave the user without
+ * SOME assistant message at the end of a turn.
+ */
+async function finalSummary(
+  sessionId: string,
+  pendingContext?: PendingConfirmation,
+  systemSuffix?: string
+): Promise<string> {
+  const sessions = getAgentSessionStore();
+  const llm = llmProviderFactory.get();
+  const session = sessions.get(sessionId);
+  if (!session) return "(no session)";
+  try {
+    const resp = await llm.sendMessage({
+      temperature: 0.2,
+      messages: buildPromptMessages(session.messages, pendingContext, systemSuffix),
+    });
+    const text = resp.content.trim() || "(done)";
+    sessions.appendMessage(sessionId, {
+      role: "assistant",
+      content: text,
+    });
+    return text;
+  } catch (err) {
+    log.warn("finalSummary: failed", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return "(done — summary failed)";
+  }
+}
+
+function countToolCallsInSession(messages: AgentMessage[]): number {
+  // We bound tool calls to the CURRENT user turn, which is everything since
+  // the last `user` message. Anything before that came from a previous turn
+  // and shouldn't count against this turn's budget.
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.role === "user") {
+      lastUserIdx = i;
+      break;
+    }
+  }
+  if (lastUserIdx === -1) return 0;
+  let count = 0;
+  for (let i = lastUserIdx + 1; i < messages.length; i++) {
+    if (messages[i]!.role === "tool_call") count += 1;
+  }
+  return count;
+}
+
+function toDescriptor(tool: AnyAgentTool): ToolDescriptor {
+  return {
+    name: tool.name,
+    description: tool.description,
+    parameters: zodToJsonSchema(tool.parameters),
+  };
+}
+
+/**
+ * Tool dispatch via the registry erases the per-tool I/O types, so the
+ * orchestrator goes through this thin `unknown`-typed shim. Concrete tools
+ * remain strictly typed at their own definition sites.
+ */
+async function runToolUnknown(
+  tool: AnyAgentTool,
+  args: unknown,
+  ctx: ToolCtx
+): Promise<unknown> {
+  // We have already validated `args` against `tool.parameters`, so this
+  // cast is sound at runtime even though the type system can't see it.
+  const concrete = tool as AgentTool<unknown, unknown>;
+  return concrete.run(args, ctx);
+}
+
+/**
+ * Flatten the session's `AgentMessage[]` into the provider's chat-message
+ * shape. Tool calls / results are folded into adjacent assistant / system
+ * messages so providers without first-class tool-message support still
+ * see the conversational context.
+ *
+ * If a `pendingContext` is supplied, an additional system note is
+ * appended so the model knows there's an outstanding confirmation it
+ * should EITHER re-surface (e.g. with clearer phrasing) or steer around.
+ * The model NEVER receives the actual confirmation token.
+ */
+function buildPromptMessages(
+  messages: AgentMessage[],
+  pendingContext?: PendingConfirmation,
+  systemSuffix?: string
+): LLMMessage[] {
+  const systemContent = systemSuffix
+    ? `${SYSTEM_PROMPT}\n\n${systemSuffix.trim()}`
+    : SYSTEM_PROMPT;
+  const out: LLMMessage[] = [{ role: "system", content: systemContent }];
+  for (const m of messages) {
+    if (m.role === "user") {
+      out.push({ role: "user", content: m.content });
+    } else if (m.role === "assistant") {
+      out.push({ role: "assistant", content: m.content });
+    } else if (m.role === "tool_call") {
+      // Surfaced as an assistant turn so the next prompt knows the tool
+      // was invoked and with what arguments.
+      out.push({
+        role: "assistant",
+        content: `[tool_call:${m.toolName}] ${stringifyArgs(m.args)}`,
+      });
+    } else if (m.role === "tool_result") {
+      out.push({
+        role: "system",
+        content:
+          `[tool_result:${m.toolName}] ` + stringifyArgs(m.result),
+      });
+    }
+  }
+  if (pendingContext) {
+    // Strip the token from any args echoed back so the model can't claim
+    // it. Candidates are summarised by path/title only.
+    const safeArgs = stringifyArgs(stripConfirmationToken(pendingContext.args));
+    const candidateSummary = summariseCandidates(pendingContext.candidates);
+    out.push({
+      role: "system",
+      content:
+        `There is a pending confirmation: tool=${pendingContext.toolName} args=${safeArgs}. ` +
+        `The user must accept or decline it before it can run; you do NOT have its token. ` +
+        (candidateSummary
+          ? `Candidates available for ordinal selection: ${candidateSummary}.`
+          : "") +
+        " You may re-surface the candidates or change topic; do not silently re-issue the same tool call.",
+    });
+  }
+  return out;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function summariseCandidates(candidates: any[] | undefined): string {
+  if (!Array.isArray(candidates) || candidates.length === 0) return "";
+  return candidates
+    .slice(0, 5)
+    .map((c, i) => {
+      if (c && typeof c === "object") {
+        const obj = c as Record<string, unknown>;
+        const path = typeof obj.path === "string" ? obj.path : undefined;
+        const title = typeof obj.title === "string" ? obj.title : undefined;
+        return `${i + 1}=${title ?? path ?? "?"}`;
+      }
+      return `${i + 1}=${String(c)}`;
+    })
+    .join("; ");
+}
+
+function stringifyArgs(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}

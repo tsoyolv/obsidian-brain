@@ -8,9 +8,6 @@ export type {
   ChatInput,
   ChatResponse,
   ChatUsage,
-  Intent,
-  IntentDataMap,
-  IntentResult,
   LLMMessage,
 } from "./dto";
 
@@ -25,4 +22,6 @@ export type {
   LLMProvider,
   SummaryInput,
   SummaryResult,
+  ToolChatFrame,
+  ToolDescriptor,
 } from "./types";

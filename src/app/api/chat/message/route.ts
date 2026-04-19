@@ -15,9 +15,27 @@ const BodySchema = z.object({
 
 /**
  * Streams the assistant's response for a single user message via SSE.
- * Frame payload shape:
- *   { delta: string, done: boolean, messageId: string }
- * Followed by an `end` event when the stream completes.
+ *
+ * Two stream shapes share this endpoint, dispatched by the chat session's
+ * `agentEnabled` flag (chosen on the server, not the client):
+ *
+ *   1. Plain chat (legacy): one or more `delta` events followed by an
+ *      `end` event. Frame payload:
+ *        { delta: string, done: boolean, messageId: string, usage? }
+ *
+ *   2. Agent chat: one event per orchestrator {@link AgentEvent}, mirroring
+ *      `/api/agent/capture` exactly so the UI can reuse its capture
+ *      renderers:
+ *        event: tool_call          data: { type, callId, name, args }
+ *        event: tool_result        data: { type, callId, name, result }
+ *        event: message_delta      data: { type, text }
+ *        event: needs_confirmation data: { type, token, toolName, args, preview }
+ *        event: final              data: { type, message }
+ *      Followed by a terminal `done` event carrying turn-level usage so the
+ *      chat budget bar updates after agent turns too:
+ *        event: done               data: { messageId, usage }
+ *
+ * Both shapes terminate with an `end` event.
  */
 export async function POST(req: Request) {
   let body: z.infer<typeof BodySchema>;
@@ -31,7 +49,8 @@ export async function POST(req: Request) {
   }
 
   const chat = getChatService();
-  if (!(await chat.getSession(body.sessionId))) {
+  const session = await chat.getSession(body.sessionId);
+  if (!session) {
     log.warn("unknown session", { sessionId: body.sessionId });
     return fail(`Unknown chat session: ${body.sessionId}`, 404);
   }
@@ -39,29 +58,50 @@ export async function POST(req: Request) {
   log.info("stream: open", {
     sessionId: body.sessionId,
     userChars: body.content.length,
+    agentEnabled: Boolean(session.agentEnabled),
   });
 
   return sseResponse(
     async function* () {
       let chunks = 0;
-      for await (const chunk of chat.streamUserMessage(body)) {
-        if (chunk.delta) chunks += 1;
-        yield {
-          data: {
-            delta: chunk.delta,
-            done: chunk.done,
-            messageId: chunk.assistantMessageId,
-            usage: chunk.usage,
-          },
-        };
-        if (chunk.done) {
-          log.info("stream: done", {
+      let agentEvents = 0;
+      for await (const frame of chat.streamUserMessage(body)) {
+        if (frame.kind === "chat") {
+          if (frame.delta) chunks += 1;
+          yield {
+            data: {
+              delta: frame.delta,
+              done: frame.done,
+              messageId: frame.assistantMessageId,
+              usage: frame.usage,
+            },
+          };
+          if (frame.done) {
+            log.info("stream: done (chat)", {
+              sessionId: body.sessionId,
+              chunks,
+              sessionTotalTokens: frame.usage?.sessionTotalTokens,
+              lastTurnTotalTokens: frame.usage?.lastTurnTotalTokens,
+            });
+            break;
+          }
+        } else if (frame.kind === "agent") {
+          agentEvents += 1;
+          yield { event: frame.event.type, data: frame.event };
+        } else if (frame.kind === "agent_done") {
+          log.info("stream: done (agent)", {
             sessionId: body.sessionId,
-            chunks,
-            sessionTotalTokens: chunk.usage?.sessionTotalTokens,
-            lastTurnTotalTokens: chunk.usage?.lastTurnTotalTokens,
+            agentEvents,
+            sessionTotalTokens: frame.usage.sessionTotalTokens,
+            lastTurnTotalTokens: frame.usage.lastTurnTotalTokens,
           });
-          break;
+          yield {
+            event: "done",
+            data: {
+              messageId: frame.assistantMessageId,
+              usage: frame.usage,
+            },
+          };
         }
       }
       yield { event: "end", data: {} };

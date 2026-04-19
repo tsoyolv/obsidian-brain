@@ -7,6 +7,7 @@ export interface SessionSummary {
   title: string;
   updatedAt: string;
   messageCount: number;
+  agentEnabled?: boolean;
   totalTokensUsed?: number;
   nextPromptEstimateTokens?: number;
 }

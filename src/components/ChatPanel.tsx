@@ -6,7 +6,17 @@ import { ChatSessionList, type SessionSummary } from "./ChatSessionList";
 import { MessageBubble } from "./MessageBubble";
 import { MicButton } from "./MicButton";
 import { ErrorBanner, SkeletonLines, Spinner, ThinkingDots } from "./Spinner";
+import {
+  AgentTurnTimeline,
+  applyAgentEvent,
+  emptyAgentTurn,
+  type AgentSseEvent,
+  type AgentStep,
+  type AgentTurnState,
+  type PendingConfirmation,
+} from "./AgentTimeline";
 import type { ChatMessage } from "@/lib/types";
+import type { ToolResult } from "@/lib/agent/types";
 
 interface SessionFull {
   id: string;
@@ -15,6 +25,7 @@ interface SessionFull {
   updatedAt: string;
   transcriptPath?: string;
   messages: ChatMessage[];
+  agentEnabled?: boolean;
   totalTokensUsed?: number;
   nextPromptEstimateTokens?: number;
 }
@@ -36,6 +47,23 @@ function formatTokens(n: number): string {
   return String(n);
 }
 
+/**
+ * Per-turn live state for the active agent run. Held outside `current` so
+ * we can surgically update it on every SSE frame without churning the
+ * whole session object (which would force the message list to re-render).
+ *
+ * Once the turn finishes, the timeline is left in place inside the
+ * trailing assistant `MessageBubble` so the user can still inspect tool
+ * chips after the stream closes.
+ */
+interface ActiveAgentTurn {
+  userMessageId: string;
+  assistantMessageId?: string;
+  state: AgentTurnState;
+  pending: boolean;
+  error?: string;
+}
+
 export function ChatPanel() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [current, setCurrent] = useState<SessionFull | null>(null);
@@ -43,6 +71,7 @@ export function ChatPanel() {
   const [draft, setDraft] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [streamingText, setStreamingText] = useState("");
+  const [activeAgent, setActiveAgent] = useState<ActiveAgentTurn | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [summary, setSummary] = useState<{ path: string; text: string } | null>(
     null
@@ -53,6 +82,7 @@ export function ChatPanel() {
   const [loadingSession, setLoadingSession] = useState(false);
   const [loadingSessions, setLoadingSessions] = useState(true);
   const [transcribing, setTranscribing] = useState(false);
+  const [togglingAgent, setTogglingAgent] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const draftRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -78,7 +108,12 @@ export function ChatPanel() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [current?.messages.length, streamingText]);
+  }, [
+    current?.messages.length,
+    streamingText,
+    activeAgent?.state.steps.length,
+    activeAgent?.state.finalMessage,
+  ]);
 
   async function createSession(): Promise<SessionFull | null> {
     if (creating) return null;
@@ -96,6 +131,7 @@ export function ChatPanel() {
       setCurrent(session);
       setSummary(null);
       setLastTurn(null);
+      setActiveAgent(null);
       if (typeof json.data.tokenLimit === "number") {
         setTokenLimit(json.data.tokenLimit);
       }
@@ -114,19 +150,19 @@ export function ChatPanel() {
     const found = sessions.find((s) => s.id === id);
     if (!found) return;
 
-    // Show the header immediately so the panel doesn't look frozen, then
-    // hydrate the message history from the vault transcript via the API.
     setCurrent({
       id: found.id,
       title: found.title,
       createdAt: found.updatedAt,
       updatedAt: found.updatedAt,
       messages: [],
+      agentEnabled: found.agentEnabled,
       totalTokensUsed: found.totalTokensUsed,
       nextPromptEstimateTokens: found.nextPromptEstimateTokens,
     });
     setSummary(null);
     setLastTurn(null);
+    setActiveAgent(null);
     setError(null);
     setLoadingSession(true);
 
@@ -135,8 +171,6 @@ export function ChatPanel() {
       const json = await res.json();
       if (!json.ok) throw new Error(json.error?.message ?? "Failed to load session");
       const full = json.data as SessionFull & { tokenLimit?: number };
-      // Guard against the user clicking another session while this one was
-      // still loading — only commit if it's still the active selection.
       setCurrent((prev) => (prev?.id === id ? full : prev));
       if (typeof json.data.tokenLimit === "number") {
         setTokenLimit(json.data.tokenLimit);
@@ -148,6 +182,144 @@ export function ChatPanel() {
     }
   }
 
+  /**
+   * PATCH the session's `agentEnabled` flag. Optimistically updates local
+   * state so the toggle feels instantaneous; rolls back on error.
+   */
+  async function toggleAgent(next: boolean) {
+    if (!current || togglingAgent || streaming) return;
+    setTogglingAgent(true);
+    setError(null);
+    const previous = current.agentEnabled ?? false;
+    setCurrent((prev) => (prev ? { ...prev, agentEnabled: next } : prev));
+    setSessions((prev) =>
+      prev.map((s) => (s.id === current.id ? { ...s, agentEnabled: next } : s))
+    );
+    try {
+      const res = await fetch(
+        `/api/chat/sessions/${encodeURIComponent(current.id)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ agentEnabled: next }),
+        }
+      );
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error?.message ?? "Failed");
+    } catch (e) {
+      setCurrent((prev) =>
+        prev ? { ...prev, agentEnabled: previous } : prev
+      );
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === current.id ? { ...s, agentEnabled: previous } : s
+        )
+      );
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTogglingAgent(false);
+    }
+  }
+
+  /**
+   * Stream a chat SSE response and dispatch frames into either the legacy
+   * plain-chat handler (`delta`/`done`) or the agent timeline handler
+   * (`tool_call` / `tool_result` / `message_delta` / `needs_confirmation`
+   * / `final` / `done`). Both shapes share a single `end` terminator so
+   * the loop is the same.
+   *
+   * `agentMode` is the SERVER's authoritative answer about which shape to
+   * expect — set by inspecting the session before opening the stream so
+   * the UI doesn't have to peek inside the first frame.
+   */
+  async function streamChatResponse(
+    res: Response,
+    agentMode: boolean,
+    handlers: {
+      onChatDelta: (delta: string) => void;
+      onChatDone: (messageId: string, usage?: TurnUsage) => void;
+      onAgentEvent: (ev: AgentSseEvent) => void;
+      onAgentDone: (messageId: string, usage: TurnUsage) => void;
+    }
+  ): Promise<void> {
+    if (!res.body) throw new Error("Stream missing body");
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let done = false;
+
+    while (!done) {
+      const { value: chunk, done: rdDone } = await reader.read();
+      if (rdDone) break;
+      buf += decoder.decode(chunk, { stream: true });
+
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const lines = frame.split("\n");
+        let event = "message";
+        const dataLines: string[] = [];
+        for (const ln of lines) {
+          if (ln.startsWith(":")) continue;
+          if (ln.startsWith("event:")) event = ln.slice(6).trim();
+          else if (ln.startsWith("data:")) dataLines.push(ln.slice(5).trim());
+        }
+        const dataStr = dataLines.join("\n");
+        if (event === "end") {
+          done = true;
+          break;
+        }
+        if (event === "error") {
+          try {
+            const e = JSON.parse(dataStr) as { message?: string };
+            throw new Error(e.message ?? "stream error");
+          } catch (parseErr) {
+            if (parseErr instanceof Error && parseErr.message !== "stream error") {
+              throw parseErr;
+            }
+            throw new Error(dataStr || "stream error");
+          }
+        }
+        if (!dataStr) continue;
+
+        let payload: unknown;
+        try {
+          payload = JSON.parse(dataStr);
+        } catch {
+          continue;
+        }
+
+        if (!agentMode) {
+          const p = payload as {
+            delta?: string;
+            done?: boolean;
+            messageId?: string;
+            usage?: TurnUsage;
+          };
+          if (p.delta) handlers.onChatDelta(p.delta);
+          if (p.done) {
+            handlers.onChatDone(p.messageId ?? "assistant_pending", p.usage);
+            done = true;
+            break;
+          }
+          continue;
+        }
+
+        // Agent path. The terminal `done` event carries usage; everything
+        // else is a forwarded AgentEvent matching the capture-route shape.
+        if (event === "done") {
+          const p = payload as { messageId?: string; usage?: TurnUsage };
+          if (p.usage) {
+            handlers.onAgentDone(p.messageId ?? "assistant_pending", p.usage);
+          }
+          continue;
+        }
+        handlers.onAgentEvent(payload as AgentSseEvent);
+      }
+    }
+  }
+
   async function sendMessage(overrideText?: string) {
     const value = (overrideText ?? draft).trim();
     if (!value || streaming) return;
@@ -156,6 +328,7 @@ export function ChatPanel() {
       session = await createSession();
       if (!session) return;
     }
+    const agentMode = Boolean(session.agentEnabled);
 
     setStreaming(true);
     setError(null);
@@ -172,13 +345,21 @@ export function ChatPanel() {
       prev ? { ...prev, messages: [...prev.messages, userMsg] } : prev
     );
 
+    if (agentMode) {
+      setActiveAgent({
+        userMessageId: userMsg.id,
+        state: emptyAgentTurn(false),
+        pending: true,
+      });
+    }
+
     try {
       const res = await fetch("/api/chat/message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessionId: session.id, content: value }),
       });
-      if (!res.ok || !res.body) {
+      if (!res.ok) {
         const txt = await res.text().catch(() => "");
         throw new Error(`Stream failed: ${res.status} ${txt}`);
       }
@@ -186,106 +367,223 @@ export function ChatPanel() {
       let assistantMessageId = "assistant_pending";
       let assistantText = "";
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      let done = false;
+      await streamChatResponse(res, agentMode, {
+        onChatDelta: (delta) => {
+          assistantText += delta;
+          flushSync(() => setStreamingText(assistantText));
+        },
+        onChatDone: (id, usage) => {
+          assistantMessageId = id;
+          if (usage) {
+            applyTurnUsage(usage);
+          }
+        },
+        onAgentEvent: (ev) => {
+          flushSync(() => {
+            setActiveAgent((prev) =>
+              prev ? { ...prev, state: applyAgentEvent(prev.state, ev) } : prev
+            );
+          });
+        },
+        onAgentDone: (id, usage) => {
+          assistantMessageId = id;
+          applyTurnUsage(usage);
+        },
+      });
 
-      while (!done) {
-        const { value: chunk, done: rdDone } = await reader.read();
-        if (rdDone) break;
-        buf += decoder.decode(chunk, { stream: true });
-
-        // Parse SSE frames separated by blank lines.
-        let idx;
-        while ((idx = buf.indexOf("\n\n")) !== -1) {
-          const frame = buf.slice(0, idx);
-          buf = buf.slice(idx + 2);
-          const lines = frame.split("\n");
-          let event = "message";
-          const dataLines: string[] = [];
-          for (const ln of lines) {
-            if (ln.startsWith("event:")) event = ln.slice(6).trim();
-            else if (ln.startsWith("data:")) dataLines.push(ln.slice(5).trim());
-          }
-          const dataStr = dataLines.join("\n");
-          if (event === "end") {
-            done = true;
-            break;
-          }
-          if (event === "error") {
-            try {
-              const e = JSON.parse(dataStr);
-              throw new Error(e.message ?? "stream error");
-            } catch {
-              throw new Error(dataStr || "stream error");
-            }
-          }
-          if (!dataStr) continue;
-          try {
-            const payload = JSON.parse(dataStr) as {
-              delta: string;
-              done: boolean;
-              messageId: string;
-              usage?: TurnUsage;
-            };
-            if (payload.messageId) assistantMessageId = payload.messageId;
-            if (payload.delta) {
-              assistantText += payload.delta;
-              // flushSync bypasses React 18 automatic batching so every
-              // token chunk forces an immediate paint — otherwise deltas
-              // that arrive in the same microtask get coalesced into one
-              // render and the UI looks like it writes word-by-word.
-              flushSync(() => setStreamingText(assistantText));
-            }
-            if (payload.usage) {
-              const u = payload.usage;
-              setLastTurn(u);
-              setTokenLimit(u.limitTokens);
-              setCurrent((prev) =>
-                prev
-                  ? {
-                      ...prev,
-                      totalTokensUsed: u.sessionTotalTokens,
-                      nextPromptEstimateTokens: u.nextPromptEstimateTokens,
-                    }
-                  : prev
-              );
-            }
-            if (payload.done) {
-              done = true;
-              break;
-            }
-          } catch {
-            // Ignore malformed frames; the next ones may still be valid.
-          }
-        }
+      if (agentMode) {
+        finalizeAgentTurn(assistantMessageId);
+      } else {
+        const finalAssistant: ChatMessage = {
+          id: assistantMessageId,
+          role: "assistant",
+          content: assistantText,
+          createdAt: new Date().toISOString(),
+        };
+        setCurrent((prev) =>
+          prev
+            ? { ...prev, messages: [...prev.messages, finalAssistant] }
+            : prev
+        );
+        setStreamingText("");
       }
-
-      const finalAssistant: ChatMessage = {
-        id: assistantMessageId,
-        role: "assistant",
-        content: assistantText,
-        createdAt: new Date().toISOString(),
-      };
-      setCurrent((prev) =>
-        prev ? { ...prev, messages: [...prev.messages, finalAssistant] } : prev
-      );
-      setStreamingText("");
       await refreshSessions();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      if (agentMode) {
+        setActiveAgent((prev) =>
+          prev ? { ...prev, pending: false, error: msg } : prev
+        );
+      }
+      setError(msg);
     } finally {
       setStreaming(false);
+      if (agentMode) {
+        setActiveAgent((prev) =>
+          prev ? { ...prev, pending: false } : prev
+        );
+      }
     }
   }
 
+  function applyTurnUsage(usage: TurnUsage) {
+    setLastTurn(usage);
+    setTokenLimit(usage.limitTokens);
+    setCurrent((prev) =>
+      prev
+        ? {
+            ...prev,
+            totalTokensUsed: usage.sessionTotalTokens,
+            nextPromptEstimateTokens: usage.nextPromptEstimateTokens,
+          }
+        : prev
+    );
+  }
+
   /**
-   * Transcribe a recorded audio blob via the transcribe-only endpoint and
-   * return the recognized text (or null on failure, after surfacing the error).
-   * Unlike CapturePanel, the chat flow does NOT persist a Voice Log — the
-   * transcript just becomes a regular user turn in the conversation.
+   * After an agent stream closes, fold the live timeline state into the
+   * persistent message list. Tool calls/results land as their own
+   * tool_call/tool_result `ChatMessage` rows (matching what the server
+   * persisted to the transcript) and the assistant's final text becomes
+   * a regular assistant message. The `activeAgent` slot is then cleared.
    */
+  function finalizeAgentTurn(assistantMessageId: string) {
+    setActiveAgent((prev) => {
+      if (!prev) return prev;
+      const now = new Date().toISOString();
+      const newMsgs: ChatMessage[] = [];
+      for (const step of prev.state.steps) {
+        if (step.kind === "tool_call") {
+          newMsgs.push({
+            id: step.callId,
+            role: "tool_call",
+            content: `[tool_call:${step.name}]`,
+            createdAt: now,
+            toolName: step.name,
+            args: step.args,
+          });
+          if (step.result) {
+            newMsgs.push({
+              id: `${step.callId}:result`,
+              role: "tool_result",
+              content: `[tool_result:${step.name}]`,
+              createdAt: now,
+              toolName: step.name,
+              result: step.result,
+            });
+          }
+        }
+      }
+      const finalText =
+        prev.state.finalMessage ??
+        prev.state.steps
+          .filter((s): s is Extract<AgentStep, { kind: "message" }> => s.kind === "message")
+          .map((s) => s.text)
+          .join("\n\n");
+      if (finalText.trim().length > 0) {
+        newMsgs.push({
+          id: assistantMessageId,
+          role: "assistant",
+          content: finalText,
+          createdAt: now,
+        });
+      }
+      setCurrent((s) =>
+        s ? { ...s, messages: [...s.messages, ...newMsgs] } : s
+      );
+      return null;
+    });
+  }
+
+  /**
+   * Confirm a pending tool call inside the active agent turn. Streams the
+   * resumed orchestrator events into the SAME timeline so the assistant
+   * bubble keeps growing instead of starting a new one.
+   */
+  async function confirmActiveAgentTool() {
+    if (!current || !activeAgent?.state.pendingConfirmation) return;
+    const token = activeAgent.state.pendingConfirmation.token;
+    setStreaming(true);
+    setError(null);
+    setActiveAgent((prev) =>
+      prev
+        ? {
+            ...prev,
+            pending: true,
+            state: { ...prev.state, pendingConfirmation: undefined, confirmedNext: true },
+          }
+        : prev
+    );
+    try {
+      const res = await fetch("/api/chat/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: current.id, token }),
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(`Confirm failed: ${res.status} ${txt}`);
+      }
+      let assistantMessageId = "assistant_pending";
+      await streamChatResponse(res, true, {
+        onChatDelta: () => {},
+        onChatDone: () => {},
+        onAgentEvent: (ev) => {
+          flushSync(() => {
+            setActiveAgent((prev) =>
+              prev ? { ...prev, state: applyAgentEvent(prev.state, ev) } : prev
+            );
+          });
+        },
+        onAgentDone: (id, usage) => {
+          assistantMessageId = id;
+          applyTurnUsage(usage);
+        },
+      });
+      finalizeAgentTurn(assistantMessageId);
+      await refreshSessions();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setActiveAgent((prev) =>
+        prev ? { ...prev, pending: false, error: msg } : prev
+      );
+      setError(msg);
+    } finally {
+      setStreaming(false);
+      setActiveAgent((prev) => (prev ? { ...prev, pending: false } : prev));
+    }
+  }
+
+  async function cancelActiveAgentTool() {
+    if (!current || !activeAgent?.state.pendingConfirmation) return;
+    const token = activeAgent.state.pendingConfirmation.token;
+    setActiveAgent((prev) =>
+      prev
+        ? {
+            ...prev,
+            state: {
+              ...prev.state,
+              pendingConfirmation: undefined,
+              finalMessage: prev.state.finalMessage ?? "(cancelled)",
+            },
+            pending: false,
+          }
+        : prev
+    );
+    try {
+      // Best-effort cancel — fire-and-forget so a stale token doesn't
+      // surface as an error toast.
+      await fetch("/api/chat/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: current.id, token }),
+      });
+    } catch {
+      // see comment above
+    }
+    finalizeAgentTurn(`assistant_${Date.now()}`);
+  }
+
   async function transcribeBlob(
     blob: Blob,
     mimeType: string
@@ -321,8 +619,6 @@ export function ChatPanel() {
   async function handleRecordToText(blob: Blob, mimeType: string) {
     const text = await transcribeBlob(blob, mimeType);
     if (!text) return;
-    // Append to whatever the user already typed so partial drafts survive
-    // a follow-up dictation.
     setDraft((prev) => (prev ? `${prev.replace(/\s+$/, "")} ${text}` : text));
     queueMicrotask(() => draftRef.current?.focus());
   }
@@ -363,10 +659,6 @@ export function ChatPanel() {
   const messageList = useMemo(() => current?.messages ?? [], [current]);
 
   const sessionTokensUsed = current?.totalTokensUsed ?? 0;
-  // Context window in use right now = what we'd send on the NEXT turn.
-  // This is the number that matters for hitting the 100k hard cap, since
-  // the cumulative session total also includes completion tokens that
-  // never travel back as input.
   const contextNow = current?.nextPromptEstimateTokens ?? 0;
   const ctxPct = tokenLimit > 0 ? Math.min(100, (contextNow / tokenLimit) * 100) : 0;
   const ctxBarColor =
@@ -379,6 +671,8 @@ export function ChatPanel() {
   const lastPrompt = lastTurn?.lastTurnPromptTokens ?? 0;
   const cacheHitPct =
     lastPrompt > 0 ? Math.round((lastCached / lastPrompt) * 100) : 0;
+
+  const agentEnabled = Boolean(current?.agentEnabled);
 
   return (
     <div className="grid h-[calc(100vh-9rem)] grid-cols-1 gap-4 md:grid-cols-[260px,1fr]">
@@ -394,8 +688,18 @@ export function ChatPanel() {
       <div className="flex h-full min-h-0 flex-col rounded-xl border border-bg-border bg-bg-panel">
         <div className="flex items-center justify-between border-b border-bg-border px-4 py-3">
           <div className="min-w-0">
-            <div className="truncate text-sm font-semibold">
-              {current?.title ?? "Discussion"}
+            <div className="flex items-center gap-2">
+              <div className="truncate text-sm font-semibold">
+                {current?.title ?? "Discussion"}
+              </div>
+              {current && agentEnabled ? (
+                <span
+                  className="pill border-sky-500/40 text-sky-200"
+                  title="Agent tools enabled — replies may invoke vault tools"
+                >
+                  agent
+                </span>
+              ) : null}
             </div>
             {current?.transcriptPath ? (
               <div className="truncate font-mono text-[11px] text-ink-dim">
@@ -408,6 +712,21 @@ export function ChatPanel() {
             )}
           </div>
           <div className="flex items-center gap-3">
+            {current ? (
+              <label
+                className="flex cursor-pointer items-center gap-1 text-[11px] text-ink-dim"
+                title="When on, the assistant can call vault tools (search, save, etc.) inside this chat"
+              >
+                <input
+                  type="checkbox"
+                  className="h-3 w-3 accent-sky-500"
+                  checked={agentEnabled}
+                  disabled={togglingAgent || streaming}
+                  onChange={(e) => void toggleAgent(e.target.checked)}
+                />
+                <span>agent</span>
+              </label>
+            ) : null}
             {current ? (
               <div
                 className="flex flex-col items-end gap-1"
@@ -508,19 +827,29 @@ export function ChatPanel() {
                 </div>
               </div>
             </div>
-          ) : messageList.length === 0 && !streamingText ? (
+          ) : messageList.length === 0 && !streamingText && !activeAgent ? (
             <div className="text-sm text-ink-dim">
-              Send the first message to begin. Responses are streamed and the
-              transcript is saved into your vault.
+              {agentEnabled
+                ? "Send the first message — this chat is agent-enabled, so the assistant can run vault tools (it will ask before reading or deleting files)."
+                : "Send the first message to begin. Responses are streamed and the transcript is saved into your vault."}
             </div>
           ) : (
             <>
-              {messageList.map((m) => (
-                <MessageBubble key={m.id} role={m.role} content={m.content} />
-              ))}
+              {renderMessageList(messageList)}
               {streaming && streamingText ? (
                 <MessageBubble role="assistant" content={streamingText} pending />
-              ) : streaming ? (
+              ) : null}
+              {activeAgent ? (
+                <ActiveAgentBubble
+                  state={activeAgent.state}
+                  pending={activeAgent.pending}
+                  pendingConfirmation={activeAgent.state.pendingConfirmation}
+                  error={activeAgent.error}
+                  onConfirm={() => void confirmActiveAgentTool()}
+                  onCancel={() => void cancelActiveAgentTool()}
+                  busy={streaming}
+                />
+              ) : streaming && !streamingText && !agentEnabled ? (
                 <div className="flex justify-start">
                   <div className="inline-flex items-center gap-2 rounded-2xl rounded-bl-md border border-bg-border bg-bg-panel px-3 py-2 text-xs text-ink-muted">
                     <ThinkingDots />
@@ -563,7 +892,11 @@ export function ChatPanel() {
                 value={draft}
                 onChange={(e) => setDraft(e.target.value)}
                 onKeyDown={onKeyDown}
-                placeholder="Ask anything… (⌘/Ctrl + Enter to send)"
+                placeholder={
+                  agentEnabled
+                    ? "Ask anything… the assistant may run vault tools (⌘/Ctrl + Enter to send)"
+                    : "Ask anything… (⌘/Ctrl + Enter to send)"
+                }
                 rows={2}
                 className="textarea resize-none"
                 disabled={streaming}
@@ -612,10 +945,166 @@ export function ChatPanel() {
   );
 }
 
+/**
+ * Render the persisted message list. Tool entries (only present in
+ * agent-enabled chats once the turn has been folded into history) are
+ * coalesced into per-call inline chips so the assistant message bubble
+ * carries its tool footprint right next to the surrounding text.
+ *
+ * The grouping rule is intentionally simple: consecutive tool_call /
+ * tool_result messages immediately preceding an assistant message are
+ * treated as that message's tool steps. Any orphan tool entry (no
+ * trailing assistant) renders inside its own assistant-style wrap.
+ */
+function renderMessageList(messages: ChatMessage[]): React.ReactNode {
+  const out: React.ReactNode[] = [];
+  let i = 0;
+  while (i < messages.length) {
+    const m = messages[i]!;
+    if (m.role === "user") {
+      out.push(<MessageBubble key={m.id} role="user" content={m.content} />);
+      i += 1;
+      continue;
+    }
+    if (m.role === "assistant" || m.role === "system") {
+      out.push(
+        <MessageBubble key={m.id} role={m.role} content={m.content} />
+      );
+      i += 1;
+      continue;
+    }
+    if (m.role === "tool_call" || m.role === "tool_result") {
+      // Collect a contiguous run of tool entries, then the trailing
+      // assistant message (if any) gets attached as the message text of
+      // the same bubble.
+      const startIdx = i;
+      const toolMsgs: ChatMessage[] = [];
+      while (
+        i < messages.length &&
+        (messages[i]!.role === "tool_call" ||
+          messages[i]!.role === "tool_result")
+      ) {
+        toolMsgs.push(messages[i]!);
+        i += 1;
+      }
+      let trailingAssistant: ChatMessage | undefined;
+      if (i < messages.length && messages[i]!.role === "assistant") {
+        trailingAssistant = messages[i]!;
+        i += 1;
+      }
+      const steps = toolEntriesToSteps(toolMsgs);
+      out.push(
+        <PersistedAgentBubble
+          key={`agent_${startIdx}`}
+          steps={steps}
+          finalMessage={trailingAssistant?.content}
+        />
+      );
+      continue;
+    }
+    i += 1;
+  }
+  return out;
+}
+
+function toolEntriesToSteps(messages: ChatMessage[]): AgentStep[] {
+  const byCallId = new Map<string, AgentStep & { kind: "tool_call" }>();
+  const out: AgentStep[] = [];
+  for (const m of messages) {
+    if (m.role === "tool_call") {
+      // Use the message id (orchestrator's callId) for re-association,
+      // falling back to the toolName + index when an older transcript
+      // didn't preserve a stable id.
+      const callId = m.id;
+      const step: AgentStep & { kind: "tool_call" } = {
+        kind: "tool_call",
+        callId,
+        name: m.toolName ?? "?",
+        args: m.args,
+      };
+      byCallId.set(callId, step);
+      out.push(step);
+    } else if (m.role === "tool_result") {
+      const target = byCallId.get(m.id);
+      if (target) {
+        target.result = m.result as ToolResult<unknown>;
+      } else {
+        // Orphan result (call message dropped by hand-edits) — surface
+        // it as its own chip so the data isn't lost from the timeline.
+        out.push({
+          kind: "tool_call",
+          callId: m.id,
+          name: m.toolName ?? "?",
+          args: undefined,
+          result: m.result as ToolResult<unknown>,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+function PersistedAgentBubble({
+  steps,
+  finalMessage,
+}: {
+  steps: AgentStep[];
+  finalMessage?: string;
+}) {
+  return (
+    <div className="flex justify-start">
+      <div className="w-full max-w-[92%] space-y-2 rounded-2xl rounded-bl-md border border-bg-border bg-bg-elevated p-3">
+        <AgentTurnTimeline
+          steps={steps}
+          finalMessage={finalMessage}
+          pending={false}
+          onConfirm={() => {}}
+          onCancel={() => {}}
+          busy={false}
+        />
+      </div>
+    </div>
+  );
+}
+
+function ActiveAgentBubble({
+  state,
+  pending,
+  pendingConfirmation,
+  error,
+  onConfirm,
+  onCancel,
+  busy,
+}: {
+  state: AgentTurnState;
+  pending: boolean;
+  pendingConfirmation?: PendingConfirmation;
+  error?: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+  busy: boolean;
+}) {
+  return (
+    <div className="flex justify-start">
+      <div className="w-full max-w-[92%] space-y-2 rounded-2xl rounded-bl-md border border-bg-border bg-bg-elevated p-3">
+        <AgentTurnTimeline
+          steps={state.steps}
+          finalMessage={state.finalMessage}
+          pending={pending}
+          pendingConfirmation={pendingConfirmation}
+          onConfirm={onConfirm}
+          onCancel={onCancel}
+          busy={busy}
+          error={error}
+        />
+      </div>
+    </div>
+  );
+}
+
 function extFromMime(mimeType: string): string {
   if (mimeType.includes("ogg")) return "ogg";
   if (mimeType.includes("mp4")) return "m4a";
   if (mimeType.includes("wav")) return "wav";
   return "webm";
 }
-

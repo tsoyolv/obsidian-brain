@@ -9,11 +9,12 @@ import type {
   FileTaskInput,
   FileTaskKind,
   FileTaskOutput,
-  IntentResult,
   LLMProvider,
   StreamDelta,
   SummaryInput,
   SummaryResult,
+  ToolChatFrame,
+  ToolDescriptor,
 } from "./types";
 
 const log = createLogger("openai-llm");
@@ -121,39 +122,104 @@ export class OpenAIChatProvider implements LLMProvider {
     }
   }
 
-  // ----- Intent classification -----
+  // ----- Tool-calling chat -----
 
-  async classifyIntent(input: string): Promise<IntentResult> {
-    const response = await this.sendMessage({
-      temperature: 0,
-      responseFormat: "json_object",
-      messages: [
-        { role: "system", content: INTENT_SYSTEM_PROMPT },
-        { role: "user", content: `User request:\n"""\n${input}\n"""` },
-      ],
+  async *chatWithTools(
+    input: ChatInput,
+    tools: ToolDescriptor[]
+  ): AsyncIterable<ToolChatFrame> {
+    const model = input.model ?? this.defaultModel;
+    const oaiTools = tools.map((t) => ({
+      type: "function" as const,
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters as Record<string, unknown>,
+      },
+    }));
+
+    const stream = await this.client.chat.completions.create({
+      model,
+      messages: input.messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+      })),
+      temperature: input.temperature,
+      max_tokens: input.maxOutputTokens,
+      tools: oaiTools.length > 0 ? oaiTools : undefined,
+      // Let the model choose freely between text and tool call. The
+      // orchestrator surfaces whichever path the model picks.
+      tool_choice: oaiTools.length > 0 ? "auto" : undefined,
+      stream: true,
+      stream_options: { include_usage: true },
     });
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(response.content);
-    } catch (err) {
-      log.warn("classifyIntent: invalid JSON, falling back to unknown", {
-        content: response.content,
-        err: String(err),
-      });
-      return { intent: "unknown", data: { reason: "invalid JSON from model" } };
+    // Tool-call args arrive as JSON streamed across many `delta.tool_calls`
+    // chunks. We accumulate per-index buffers and flush them after the
+    // stream completes (single tool call expected; the orchestrator uses
+    // only the first one anyway).
+    const toolBuffers = new Map<
+      number,
+      { name: string; argsJson: string }
+    >();
+    let finalUsage: ToolChatFrame["usage"];
+
+    for await (const part of stream) {
+      const choice = part.choices[0];
+      if (part.usage) {
+        const details = (
+          part.usage as unknown as {
+            prompt_tokens_details?: { cached_tokens?: number };
+          }
+        ).prompt_tokens_details;
+        finalUsage = {
+          promptTokens: part.usage.prompt_tokens,
+          completionTokens: part.usage.completion_tokens,
+          totalTokens: part.usage.total_tokens,
+          cachedPromptTokens: details?.cached_tokens,
+        };
+      }
+      if (!choice) continue;
+
+      const delta = choice.delta;
+      if (delta?.content) {
+        yield { type: "message_delta", delta: delta.content };
+      }
+      if (delta?.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const idx = tc.index ?? 0;
+          const existing = toolBuffers.get(idx) ?? { name: "", argsJson: "" };
+          if (tc.function?.name) existing.name = tc.function.name;
+          if (tc.function?.arguments) existing.argsJson += tc.function.arguments;
+          toolBuffers.set(idx, existing);
+        }
+      }
     }
 
-    const safe = IntentEnvelopeSchema.safeParse(parsed);
-    if (!safe.success) {
-      log.warn("classifyIntent: schema validation failed", {
-        issues: safe.error.issues,
-        raw: response.content,
-      });
-      return { intent: "unknown", data: { reason: "schema validation failed" } };
+    // Emit accumulated tool calls in index order. Args parse failures are
+    // surfaced as `args: {}` so the orchestrator can run zod validation
+    // and report a clean error back to the model.
+    const indices = [...toolBuffers.keys()].sort((a, b) => a - b);
+    for (const idx of indices) {
+      const buf = toolBuffers.get(idx)!;
+      if (!buf.name) continue;
+      let args: unknown = {};
+      const trimmed = buf.argsJson.trim();
+      if (trimmed) {
+        try {
+          args = JSON.parse(trimmed);
+        } catch (err) {
+          log.warn("chatWithTools: invalid tool args JSON", {
+            name: buf.name,
+            raw: buf.argsJson,
+            err: String(err),
+          });
+        }
+      }
+      yield { type: "tool_call", toolCall: { name: buf.name, args } };
     }
 
-    return safe.data;
+    yield { type: "done", usage: finalUsage };
   }
 
   // ----- File candidate ranking -----
@@ -291,92 +357,6 @@ export class OpenAIChatProvider implements LLMProvider {
 }
 
 // ---- Internal: prompts and parsers ----
-
-/**
- * Strict per-intent envelope. The LLM must return EXACTLY one of these shapes
- * — `discriminatedUnion` enforces the right `data` shape per intent and
- * rejects anything malformed before it reaches the business layer.
- */
-const IntentEnvelopeSchema = z.discriminatedUnion("intent", [
-  z.object({
-    intent: z.literal("note"),
-    data: z.object({
-      text: z.string().min(1),
-      title: z.string().optional(),
-      tags: z.array(z.string()).optional(),
-    }),
-  }),
-  z.object({
-    intent: z.literal("create_task"),
-    data: z.object({ taskText: z.string().min(1) }),
-  }),
-  z.object({
-    intent: z.literal("complete_task"),
-    data: z.object({ taskText: z.string().min(1) }),
-  }),
-  z.object({
-    intent: z.literal("search"),
-    data: z.object({ query: z.string().min(1) }),
-  }),
-  z.object({
-    intent: z.literal("ask_vault_question"),
-    data: z.object({ question: z.string().min(1) }),
-  }),
-  z.object({
-    intent: z.literal("find_file"),
-    data: z.object({ query: z.string().min(1) }),
-  }),
-  z.object({
-    intent: z.literal("open_file_for_task"),
-    data: z.object({
-      query: z.string().min(1),
-      task: z.string().min(1),
-    }),
-  }),
-  z.object({
-    intent: z.literal("unknown"),
-    data: z.object({ reason: z.string().optional() }).default({}),
-  }),
-]);
-
-const INTENT_SYSTEM_PROMPT = [
-  "You are an intent classifier for a personal Obsidian-backed assistant.",
-  "Given a user's short request (typed or transcribed from voice), choose",
-  "EXACTLY ONE intent and extract the fields it requires.",
-  "",
-  "Hard rules — the assistant downstream will refuse to break these, so do",
-  "not invent intents that imply them:",
-  "  * It NEVER deletes files.",
-  "  * It NEVER reads the full content of a vault file without explicit",
-  "    user confirmation. Use `find_file` / `open_file_for_task` to surface",
-  "    candidates so the user can confirm before any read.",
-  "",
-  "Intents and their required `data` payloads:",
-  '  - "note":               { text: string, title?: string, tags?: string[] }',
-  '       User wants to save a thought / idea / content as a note.',
-  '  - "create_task":        { taskText: string }',
-  '       User wants to add a TODO / action item.',
-  '  - "complete_task":      { taskText: string }',
-  '       User wants to mark an existing open task as done. `taskText` is the',
-  '       fuzzy-search needle, not necessarily a verbatim quote.',
-  '  - "search":             { query: string }',
-  '       Keyword search across the vault. Use this when the user wants a',
-  '       list of matching notes (NOT a synthesized answer).',
-  '  - "ask_vault_question": { question: string }',
-  '       The user is asking a question to be answered from vault content.',
-  '  - "find_file":          { query: string }',
-  '       The user wants to locate a file by name/title only. No body is read.',
-  '  - "open_file_for_task": { query: string, task: string }',
-  '       The user wants to open / inspect a specific file in order to perform',
-  '       some follow-up `task` (e.g. "open my reading list and add this book").',
-  '       The handler will surface the matched file and ASK FOR CONFIRMATION',
-  '       before reading it.',
-  '  - "unknown":            { reason?: string }',
-  '       Use when nothing else clearly applies.',
-  "",
-  'Respond with STRICT JSON only, exactly: { "intent": "...", "data": { ... } }',
-  "No prose, no markdown, no extra fields.",
-].join("\n");
 
 const FileRankSchema = z.object({
   bestPath: z.string().min(1).nullable(),

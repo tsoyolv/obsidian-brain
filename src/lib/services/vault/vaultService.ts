@@ -7,9 +7,11 @@ import type { NoteFrontmatter } from "@/lib/types";
 import {
   appendUtf8,
   ensureDir,
+  type FileStat,
   move,
   pathExists,
   readUtf8,
+  statFile,
   writeUtf8,
 } from "./internal/fsAdapter";
 import {
@@ -111,6 +113,8 @@ export interface SoftDeleteResult {
   path: string;
 }
 
+export type { FileStat } from "./internal/fsAdapter";
+
 export interface FileMatch {
   /** Vault-relative path. */
   path: string;
@@ -144,6 +148,13 @@ export interface VaultService {
 
   // Read / write
   fileExists(relPath: string): Promise<boolean>;
+  /**
+   * Cheap metadata lookup (mtime, size). Read-only; never opens the file
+   * body. Used by `searchService` to key its parsed-headings cache so a
+   * file whose contents haven't changed reuses parsed structure across
+   * queries.
+   */
+  statFile(relPath: string): Promise<FileStat>;
   createNote(input: CreateNoteInput): Promise<CreateNoteResult>;
   ensureNoteExists(relPath: string, initialContent: string): Promise<void>;
   appendToNote(relPath: string, content: string): Promise<void>;
@@ -215,6 +226,10 @@ class VaultServiceImpl implements VaultService {
 
   async fileExists(relPath: string): Promise<boolean> {
     return pathExists(this.resolve(relPath));
+  }
+
+  async statFile(relPath: string): Promise<FileStat> {
+    return statFile(this.resolve(relPath));
   }
 
   async createNote(input: CreateNoteInput): Promise<CreateNoteResult> {

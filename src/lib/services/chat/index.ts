@@ -6,5 +6,7 @@ export {
   type AppendMessageInput,
   type SummaryResult,
   type StreamEvent,
+  type ChatStreamEvent,
+  type ChatAgentStreamEvent,
   type SessionTokenUsage,
 } from "./chatService";

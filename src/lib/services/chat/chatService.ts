@@ -1,5 +1,9 @@
 import { llmProviderFactory } from "@/lib/providers/llm";
 import type { ChatUsage, LLMMessage } from "@/lib/providers/llm/types";
+import { confirmTurn, runTurn } from "@/lib/agent/orchestrator";
+import type { AgentEvent } from "@/lib/agent/orchestrator";
+import { getAgentSessionStore } from "@/lib/agent/session";
+import type { AgentMessage } from "@/lib/agent/types";
 import { getVaultService, VAULT_FOLDERS } from "@/lib/services/vault";
 import { compactLocalStamp, newId, nowIso } from "@/lib/utils/id";
 import { ensureMarkdownExt } from "@/lib/utils/filenames";
@@ -56,6 +60,13 @@ const ROLLING_SUMMARY_SYSTEM_PROMPT =
 export interface CreateSessionInput {
   title?: string;
   systemPrompt?: string;
+  /**
+   * When true, the session routes turns through the agent orchestrator
+   * (tool calls + confirmations). Default false; can be flipped per
+   * session via {@link ChatService.setAgentEnabled} so existing chats
+   * are not disrupted.
+   */
+  agentEnabled?: boolean;
 }
 
 export interface AppendMessageInput {
@@ -69,7 +80,13 @@ export interface SummaryResult {
   actionItems: string[];
 }
 
-export interface StreamEvent {
+/**
+ * Frame yielded by {@link ChatService.streamUserMessage} for plain (non-
+ * agent) sessions. Mirrors the legacy streaming contract: incremental
+ * deltas plus a terminal `done` frame carrying the per-turn usage.
+ */
+export interface ChatStreamEvent {
+  kind: "chat";
   delta: string;
   done: boolean;
   assistantMessageId: string;
@@ -80,6 +97,18 @@ export interface StreamEvent {
    */
   usage?: SessionTokenUsage;
 }
+
+/**
+ * Frame yielded by {@link ChatService.streamUserMessage} for agent-driven
+ * sessions. Wraps the orchestrator's {@link AgentEvent} stream and adds a
+ * terminal `done` frame so the chat layer can attach usage / turn
+ * accounting in the same shape as the plain chat path.
+ */
+export type ChatAgentStreamEvent =
+  | { kind: "agent"; event: AgentEvent }
+  | { kind: "agent_done"; usage: SessionTokenUsage; assistantMessageId: string };
+
+export type StreamEvent = ChatStreamEvent | ChatAgentStreamEvent;
 
 export interface SessionTokenUsage {
   /** Real tokens reported by the provider for the most recent turn. */
@@ -109,17 +138,45 @@ export interface ChatService {
   listSessions(): Promise<ChatSession[]>;
   getSession(id: string): Promise<ChatSession | undefined>;
   /**
+   * Toggle agent-routing for the session. Persisted in the transcript
+   * frontmatter so the choice survives restarts. Returns the updated
+   * session.
+   */
+  setAgentEnabled(sessionId: string, enabled: boolean): Promise<ChatSession>;
+  /**
    * Heuristic estimate of the prompt size that would be sent on the next
    * turn for this session (system + rolling summary + pinned + raw tail).
    * Cheap pure function — safe to call from list/GET endpoints.
    */
   estimateNextPromptTokens(session: ChatSession): number;
   /**
-   * Streams the assistant response for a new user message.
+   * Streams the assistant response for a new user message. For
+   * `agentEnabled` sessions the stream carries `kind: "agent"` frames
+   * wrapping the orchestrator's {@link AgentEvent}; for plain sessions
+   * it carries the legacy `kind: "chat"` deltas. Both terminate with a
+   * usage-bearing terminal frame.
+   *
    * Persists the user message before streaming and the assistant message
-   * once streaming completes.
+   * (plus any agent tool entries) once streaming completes.
    */
   streamUserMessage(input: AppendMessageInput): AsyncIterable<StreamEvent>;
+  /**
+   * Resume an agent turn after the user explicitly confirms a pending
+   * tool call. Only valid for `agentEnabled` sessions; throws otherwise.
+   */
+  confirmAgentTurn(input: {
+    sessionId: string;
+    token: string;
+  }): AsyncIterable<ChatAgentStreamEvent>;
+  /**
+   * Cancel a pending agent confirmation. Idempotent — a stale token is
+   * treated as already-cancelled. Only valid for `agentEnabled`
+   * sessions.
+   */
+  cancelAgentConfirmation(input: {
+    sessionId: string;
+    token: string;
+  }): Promise<{ matched: boolean }>;
   summarize(sessionId: string): Promise<SummaryResult>;
 }
 
@@ -239,12 +296,22 @@ class ChatServiceImpl implements ChatService {
       parsed[parsed.length - 1]?.createdAt ||
       createdAt;
 
-    const messages: ChatMessage[] = parsed.map((p) => ({
-      id: newId("msg"),
-      role: p.role,
-      content: p.content,
-      createdAt: p.createdAt || createdAt,
-    }));
+    const messages: ChatMessage[] = parsed.map((p) => {
+      const base: ChatMessage = {
+        id: newId("msg"),
+        role: p.role,
+        content: p.content,
+        createdAt: p.createdAt || createdAt,
+      };
+      if (p.role === "tool_call") {
+        base.toolName = p.toolName;
+        base.args = p.args;
+      } else if (p.role === "tool_result") {
+        base.toolName = p.toolName;
+        base.result = p.result;
+      }
+      return base;
+    });
 
     const summary =
       typeof data.running_summary === "string" && data.running_summary.length > 0
@@ -265,6 +332,9 @@ class ChatServiceImpl implements ChatService {
         ? totalTokensRaw
         : undefined;
 
+    const agentEnabled =
+      typeof data.agent_enabled === "boolean" ? data.agent_enabled : undefined;
+
     return {
       id,
       title,
@@ -272,6 +342,7 @@ class ChatServiceImpl implements ChatService {
       updatedAt,
       messages,
       transcriptPath: relPath,
+      agentEnabled,
       summary,
       summaryUpTo,
       totalTokensUsed,
@@ -320,9 +391,19 @@ class ChatServiceImpl implements ChatService {
       }
     }
 
-    // Raw tail: everything the summary doesn't yet cover.
+    // Raw tail: everything the summary doesn't yet cover. Tool entries
+    // (only present in agentEnabled sessions) are inlined as a system
+    // breadcrumb so they participate in non-agent prompts too — they
+    // never appear here for plain chats anyway.
     for (let i = summaryUpTo; i < msgs.length; i++) {
       const m = msgs[i]!;
+      if (m.role === "tool_call" || m.role === "tool_result") {
+        out.push({
+          role: "system",
+          content: renderToolEntryAsText(m),
+        });
+        continue;
+      }
       out.push({ role: m.role, content: m.content });
     }
     return out;
@@ -354,8 +435,17 @@ class ChatServiceImpl implements ChatService {
     if (newTurns.length === 0) return;
 
     const prevSummary = session.summary?.trim() ?? "";
+    // Tool entries are flattened to a single line each so the summarizer
+    // sees the prior turn AS A WHOLE — model invocations + the data they
+    // produced — instead of just the user/assistant text. Otherwise the
+    // rolling summary would silently drop everything the agent did.
     const transcriptBlock = newTurns
-      .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+      .map((m) => {
+        if (m.role === "tool_call" || m.role === "tool_result") {
+          return renderToolEntryAsText(m);
+        }
+        return `${m.role.toUpperCase()}: ${m.content}`;
+      })
       .join("\n\n");
 
     const userPayload =
@@ -415,6 +505,9 @@ class ChatServiceImpl implements ChatService {
     if (session.totalTokensUsed !== undefined) {
       patch.total_tokens_used = session.totalTokensUsed;
     }
+    if (session.agentEnabled !== undefined) {
+      patch.agent_enabled = session.agentEnabled;
+    }
     try {
       await this.vault.updateFrontmatter(session.transcriptPath, patch);
     } catch (err) {
@@ -433,12 +526,15 @@ class ChatServiceImpl implements ChatService {
     const now = nowIso();
     const title = (input?.title ?? `Chat ${compactLocalStamp()}`).trim() || "Chat";
 
+    const agentEnabled = input?.agentEnabled === true ? true : false;
+
     const session: ChatSession = {
       id,
       title,
       createdAt: now,
       updatedAt: now,
       messages: [],
+      agentEnabled,
     };
 
     const stamp = compactLocalStamp();
@@ -455,6 +551,7 @@ class ChatServiceImpl implements ChatService {
         updated: now,
         provider: llm.id,
         model: llm.defaultModel,
+        agent_enabled: agentEnabled,
       },
       uniqueOnConflict: true,
     });
@@ -475,6 +572,20 @@ class ChatServiceImpl implements ChatService {
     const cached = this.store.get(id);
     if (cached) return cached;
     return this.hydrateSessionById(id);
+  }
+
+  async setAgentEnabled(
+    sessionId: string,
+    enabled: boolean
+  ): Promise<ChatSession> {
+    let session = this.store.get(sessionId);
+    if (!session) session = await this.hydrateSessionById(sessionId);
+    if (!session) throw new Error(`Unknown chat session: ${sessionId}`);
+    session.agentEnabled = enabled;
+    session.updatedAt = nowIso();
+    await this.persistSessionState(session);
+    log.info("setAgentEnabled", { sessionId, enabled });
+    return session;
   }
 
   estimateNextPromptTokens(session: ChatSession): number {
@@ -500,6 +611,7 @@ class ChatServiceImpl implements ChatService {
       sessionId: session.id,
       messageCount: session.messages.length,
       userChars: input.content.length,
+      agentEnabled: Boolean(session.agentEnabled),
     });
 
     const userMessage: ChatMessage = {
@@ -526,6 +638,24 @@ class ChatServiceImpl implements ChatService {
     // new message is guaranteed to reach the model raw.
     await this.maybeCompact(session, systemPrompt);
 
+    if (session.agentEnabled) {
+      yield* this.streamAgentTurn(session, systemPrompt, tTurn);
+      return;
+    }
+
+    yield* this.streamPlainTurn(session, systemPrompt, tTurn);
+  }
+
+  /**
+   * Plain (non-agent) turn: stream the LLM completion directly into the
+   * transcript. Identical behaviour to the legacy implementation; the
+   * `kind: "chat"` discriminator makes the SSE-side branching trivial.
+   */
+  private async *streamPlainTurn(
+    session: ChatSession,
+    systemPrompt: string,
+    tTurn: ReturnType<typeof log.time>
+  ): AsyncIterable<ChatStreamEvent> {
     const llmMessages = this.buildPromptMessages(session, systemPrompt);
 
     const assistantId = newId("msg");
@@ -544,6 +674,7 @@ class ChatServiceImpl implements ChatService {
         buffer += frame.delta;
         chunks += 1;
         yield {
+          kind: "chat",
           delta: frame.delta,
           done: false,
           assistantMessageId: assistantId,
@@ -568,9 +699,6 @@ class ChatServiceImpl implements ChatService {
     session.messages.push(assistantMessage);
     session.updatedAt = assistantMessage.createdAt;
 
-    // Token accounting. Prefer the provider's real counts; fall back to
-    // a local estimate so the UI counter never regresses to zero on
-    // providers/models that omit `usage` for streamed completions.
     const turnTokens =
       lastUsage?.totalTokens ??
       (estimateTokensForMessages(llmMessages) + estimateTokensForMessages([
@@ -610,7 +738,335 @@ class ChatServiceImpl implements ChatService {
       nextPromptEstimateTokens: usage.nextPromptEstimateTokens,
     });
 
-    yield { delta: "", done: true, assistantMessageId: assistantId, usage };
+    yield {
+      kind: "chat",
+      delta: "",
+      done: true,
+      assistantMessageId: assistantId,
+      usage,
+    };
+  }
+
+  /**
+   * Agent turn: hand off to the orchestrator, mirroring its event stream
+   * and persisting tool entries + the final assistant message to the
+   * transcript as we go. The chat session retains FULL ownership of
+   * conversational history; the orchestrator session is rebuilt from
+   * `priorContext` on every turn.
+   *
+   * The user message is already in `session.messages` at this point.
+   * `priorContext.history` is the chat tail MINUS the just-appended user
+   * message (the orchestrator will append it itself when running the
+   * turn) so the prior-context shape matches what the agent sees on a
+   * standalone capture turn.
+   */
+  private async *streamAgentTurn(
+    session: ChatSession,
+    systemPrompt: string,
+    tTurn: ReturnType<typeof log.time>
+  ): AsyncIterable<ChatAgentStreamEvent> {
+    const userMessage = session.messages[session.messages.length - 1]!;
+    const tailWithoutUser = session.messages.slice(0, -1);
+    const priorHistory = chatHistoryToAgentMessages(tailWithoutUser);
+    const systemSuffix = this.buildAgentSystemSuffix(session, systemPrompt);
+
+    const assistantId = newId("msg");
+    let assistantBuffer = "";
+    let yielded = false;
+
+    try {
+      for await (const ev of runTurn({
+        sessionId: session.id,
+        userText: userMessage.content,
+        priorContext: { history: priorHistory, systemSuffix },
+      })) {
+        yielded = true;
+        await this.handleAgentEvent(session, ev);
+        if (ev.type === "message_delta") {
+          assistantBuffer += ev.text;
+        } else if (ev.type === "final" && !assistantBuffer.trim()) {
+          assistantBuffer = ev.message;
+        }
+        yield { kind: "agent", event: ev };
+      }
+    } catch (err) {
+      tTurn.fail("streamUserMessage: agent stream failed", {
+        sessionId: session.id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
+
+    if (!yielded) {
+      log.warn("streamAgentTurn: orchestrator yielded nothing", {
+        sessionId: session.id,
+      });
+    }
+
+    // Persist the final assistant text (if any). Tool entries were
+    // already appended inline by handleAgentEvent.
+    if (assistantBuffer.trim().length > 0) {
+      const assistantMessage: ChatMessage = {
+        id: assistantId,
+        role: "assistant",
+        content: assistantBuffer,
+        createdAt: nowIso(),
+      };
+      session.messages.push(assistantMessage);
+      session.updatedAt = assistantMessage.createdAt;
+      if (session.transcriptPath) {
+        await this.vault.appendToNote(
+          session.transcriptPath,
+          renderChatMessageMarkdown(assistantMessage)
+        );
+      }
+    }
+
+    // Token accounting for agent turns is best-effort: the orchestrator
+    // doesn't currently surface per-turn usage to its caller. Estimate
+    // from the prompt-equivalent we would have built, plus the final
+    // assistant text. Tool-call rounds inside the loop are not separately
+    // metered here; the value is a floor, not a ceiling.
+    const promptEstimate = estimateTokensForMessages(
+      this.buildPromptMessages(session, systemPrompt)
+    );
+    const completionEstimate = estimateTokensForMessages([
+      { role: "assistant", content: assistantBuffer },
+    ]);
+    const turnTokens = promptEstimate + completionEstimate;
+    session.totalTokensUsed = (session.totalTokensUsed ?? 0) + turnTokens;
+
+    await this.persistSessionState(session);
+
+    const usage: SessionTokenUsage = {
+      lastTurnTotalTokens: turnTokens,
+      lastTurnPromptTokens: promptEstimate,
+      lastTurnCompletionTokens: completionEstimate,
+      sessionTotalTokens: session.totalTokensUsed,
+      nextPromptEstimateTokens: this.estimateNextPromptTokens(session),
+      limitTokens: TOKEN_HARD_LIMIT,
+    };
+
+    tTurn.done("streamUserMessage(agent)", {
+      sessionId: session.id,
+      assistantChars: assistantBuffer.length,
+      turnTokens,
+      sessionTotalTokens: session.totalTokensUsed,
+      nextPromptEstimateTokens: usage.nextPromptEstimateTokens,
+    });
+
+    yield { kind: "agent_done", usage, assistantMessageId: assistantId };
+  }
+
+  async *confirmAgentTurn(input: {
+    sessionId: string;
+    token: string;
+  }): AsyncIterable<ChatAgentStreamEvent> {
+    await this.ensureReady();
+    let session = this.store.get(input.sessionId);
+    if (!session) session = await this.hydrateSessionById(input.sessionId);
+    if (!session) {
+      throw new Error(`Unknown chat session: ${input.sessionId}`);
+    }
+    if (!session.agentEnabled) {
+      throw new Error(
+        `Chat session ${input.sessionId} is not agent-enabled; cannot confirm.`
+      );
+    }
+
+    const systemPrompt =
+      this.store.getSystemPrompt(session.id) ?? DEFAULT_SYSTEM_PROMPT;
+    const priorHistory = chatHistoryToAgentMessages(session.messages);
+    const systemSuffix = this.buildAgentSystemSuffix(session, systemPrompt);
+
+    const assistantId = newId("msg");
+    let assistantBuffer = "";
+    const tConf = log.time("confirmAgentTurn");
+
+    try {
+      for await (const ev of confirmTurn({
+        sessionId: session.id,
+        token: input.token,
+        priorContext: { history: priorHistory, systemSuffix },
+      })) {
+        await this.handleAgentEvent(session, ev);
+        if (ev.type === "message_delta") {
+          assistantBuffer += ev.text;
+        } else if (ev.type === "final" && !assistantBuffer.trim()) {
+          assistantBuffer = ev.message;
+        }
+        yield { kind: "agent", event: ev };
+      }
+    } catch (err) {
+      tConf.fail("confirmAgentTurn: failed", {
+        sessionId: session.id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
+
+    if (assistantBuffer.trim().length > 0) {
+      const assistantMessage: ChatMessage = {
+        id: assistantId,
+        role: "assistant",
+        content: assistantBuffer,
+        createdAt: nowIso(),
+      };
+      session.messages.push(assistantMessage);
+      session.updatedAt = assistantMessage.createdAt;
+      if (session.transcriptPath) {
+        await this.vault.appendToNote(
+          session.transcriptPath,
+          renderChatMessageMarkdown(assistantMessage)
+        );
+      }
+    }
+
+    const promptEstimate = estimateTokensForMessages(
+      this.buildPromptMessages(session, systemPrompt)
+    );
+    const completionEstimate = estimateTokensForMessages([
+      { role: "assistant", content: assistantBuffer },
+    ]);
+    const turnTokens = promptEstimate + completionEstimate;
+    session.totalTokensUsed = (session.totalTokensUsed ?? 0) + turnTokens;
+    await this.persistSessionState(session);
+
+    const usage: SessionTokenUsage = {
+      lastTurnTotalTokens: turnTokens,
+      lastTurnPromptTokens: promptEstimate,
+      lastTurnCompletionTokens: completionEstimate,
+      sessionTotalTokens: session.totalTokensUsed,
+      nextPromptEstimateTokens: this.estimateNextPromptTokens(session),
+      limitTokens: TOKEN_HARD_LIMIT,
+    };
+
+    tConf.done("confirmAgentTurn", {
+      sessionId: session.id,
+      assistantChars: assistantBuffer.length,
+    });
+
+    yield { kind: "agent_done", usage, assistantMessageId: assistantId };
+  }
+
+  async cancelAgentConfirmation(input: {
+    sessionId: string;
+    token: string;
+  }): Promise<{ matched: boolean }> {
+    await this.ensureReady();
+    let session = this.store.get(input.sessionId);
+    if (!session) session = await this.hydrateSessionById(input.sessionId);
+    if (!session) {
+      throw new Error(`Unknown chat session: ${input.sessionId}`);
+    }
+    if (!session.agentEnabled) {
+      throw new Error(
+        `Chat session ${input.sessionId} is not agent-enabled; nothing to cancel.`
+      );
+    }
+    const sessions = getAgentSessionStore();
+    const agentSession = sessions.get(session.id);
+    const pending = agentSession?.pendingConfirmation;
+    const matched = Boolean(pending && pending.token === input.token);
+    if (matched) {
+      sessions.setPendingConfirmation(session.id, undefined);
+    }
+    log.info("cancelAgentConfirmation", {
+      sessionId: session.id,
+      matched,
+      token: input.token,
+    });
+    return { matched };
+  }
+
+  /**
+   * Mirror an orchestrator event into the chat layer's persistent state:
+   * tool calls and tool results are appended to the chat history (and to
+   * the transcript) immediately, so a refresh during a long agent turn
+   * doesn't lose the tool footprint. `final` / `message_delta` are
+   * handled by the caller (it accumulates the assistant buffer and
+   * persists it once at the end so we don't write a partial
+   * transcript line per delta).
+   */
+  private async handleAgentEvent(
+    session: ChatSession,
+    ev: AgentEvent
+  ): Promise<void> {
+    if (ev.type === "tool_call") {
+      const m: ChatMessage = {
+        id: ev.callId,
+        role: "tool_call",
+        content: `[tool_call:${ev.name}]`,
+        createdAt: nowIso(),
+        toolName: ev.name,
+        args: ev.args,
+      };
+      session.messages.push(m);
+      session.updatedAt = m.createdAt;
+      if (session.transcriptPath) {
+        try {
+          await this.vault.appendToNote(
+            session.transcriptPath,
+            renderChatMessageMarkdown(m)
+          );
+        } catch (err) {
+          log.warn("handleAgentEvent: append tool_call failed", {
+            sessionId: session.id,
+            err: String(err),
+          });
+        }
+      }
+    } else if (ev.type === "tool_result") {
+      const m: ChatMessage = {
+        id: ev.callId,
+        role: "tool_result",
+        content: `[tool_result:${ev.name}]`,
+        createdAt: nowIso(),
+        toolName: ev.name,
+        result: ev.result,
+      };
+      session.messages.push(m);
+      session.updatedAt = m.createdAt;
+      if (session.transcriptPath) {
+        try {
+          await this.vault.appendToNote(
+            session.transcriptPath,
+            renderChatMessageMarkdown(m)
+          );
+        } catch (err) {
+          log.warn("handleAgentEvent: append tool_result failed", {
+            sessionId: session.id,
+            err: String(err),
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * Build the agent's per-turn system suffix from the chat-side state.
+   * Includes both the chat's base system prompt (so the agent shares the
+   * chat's persona) and the rolling summary (so the agent has gist-of-
+   * everything context without needing the full transcript).
+   */
+  private buildAgentSystemSuffix(
+    session: ChatSession,
+    baseSystemPrompt: string
+  ): string {
+    const parts: string[] = [];
+    if (baseSystemPrompt && baseSystemPrompt !== DEFAULT_SYSTEM_PROMPT) {
+      parts.push(`Chat persona / instructions:\n${baseSystemPrompt.trim()}`);
+    } else if (baseSystemPrompt) {
+      parts.push(baseSystemPrompt.trim());
+    }
+    if (session.summary && session.summary.trim().length > 0) {
+      parts.push(
+        "Earlier in this conversation (rolling summary, plain prose, " +
+          "not user-visible):\n" +
+          session.summary.trim()
+      );
+    }
+    return parts.join("\n\n");
   }
 
   async summarize(sessionId: string): Promise<SummaryResult> {
@@ -635,12 +1091,16 @@ class ChatServiceImpl implements ChatService {
     const llm = llmProviderFactory.get();
     let result;
     try {
-      result = await llm.summarize({
-        messages: session.messages.map((m) => ({
-          role: m.role,
-          content: m.content,
-        })),
+      // Only forward provider-native roles to the summarizer. Tool entries
+      // are flattened to one-line breadcrumbs (same shape the rolling
+      // compactor uses) so the summary still reflects what the agent did.
+      const summaryMessages: LLMMessage[] = session.messages.map((m) => {
+        if (m.role === "tool_call" || m.role === "tool_result") {
+          return { role: "system", content: renderToolEntryAsText(m) };
+        }
+        return { role: m.role, content: m.content };
       });
+      result = await llm.summarize({ messages: summaryMessages });
     } catch (err) {
       t.fail("summarize: provider failed", {
         sessionId,
@@ -702,3 +1162,62 @@ export function getChatService(): ChatService {
  * drifting out of sync with the compaction policy.
  */
 export const CHAT_TOKEN_LIMIT = TOKEN_HARD_LIMIT;
+
+// ---- helpers ----
+
+/**
+ * One-line textual rendering of a tool_call / tool_result entry. Used by
+ * both the rolling-summary compactor and the (rare) plain-chat prompt
+ * builder so the LLM sees the agent's actions as part of the prior turn.
+ */
+function renderToolEntryAsText(m: ChatMessage): string {
+  const name = m.toolName ?? "?";
+  if (m.role === "tool_call") {
+    return `[tool_call:${name}] ${stringifyCompact(m.args)}`;
+  }
+  return `[tool_result:${name}] ${stringifyCompact(m.result)}`;
+}
+
+function stringifyCompact(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * Convert a chat history slice into the orchestrator's `AgentMessage[]`
+ * shape so chat-driven turns can hand off to the agent loop with the
+ * same prior context the chat layer sees.
+ *
+ * - `system` chat messages are dropped (the orchestrator owns its own
+ *   system prompt; chat-side system messages, if any, are unrelated and
+ *   would confuse the agent's tool-use guardrails).
+ * - `tool_call` / `tool_result` entries are passed through with their
+ *   structured payloads intact so the orchestrator's `buildPromptMessages`
+ *   can fold them into the prompt the same way it does for capture turns.
+ */
+function chatHistoryToAgentMessages(messages: ChatMessage[]): AgentMessage[] {
+  const out: AgentMessage[] = [];
+  for (const m of messages) {
+    if (m.role === "user" || m.role === "assistant") {
+      out.push({ role: m.role, content: m.content });
+    } else if (m.role === "tool_call") {
+      out.push({
+        role: "tool_call",
+        id: m.id,
+        toolName: m.toolName ?? "?",
+        args: m.args,
+      });
+    } else if (m.role === "tool_result") {
+      out.push({
+        role: "tool_result",
+        id: m.id,
+        toolName: m.toolName ?? "?",
+        result: m.result,
+      });
+    }
+  }
+  return out;
+}

@@ -4,11 +4,38 @@
 
 export type Role = "system" | "user" | "assistant";
 
+/**
+ * Extended chat-history role. In addition to the standard `system`/`user`/
+ * `assistant` roles, a chat session can host inline `tool_call` and
+ * `tool_result` entries when the agent orchestrator is driving the turn.
+ *
+ * Tool entries are rendered to the transcript as collapsed `<details>`
+ * blocks for Obsidian and folded into the rolling-summary compactor as
+ * part of the prior turn (see `chatService.maybeCompact`).
+ */
+export type ChatMessageRole = Role | "tool_call" | "tool_result";
+
 export interface ChatMessage {
   id: string;
-  role: Role;
+  role: ChatMessageRole;
+  /**
+   * Display text for `user` / `assistant` / `system` messages, OR a
+   * compact human-readable rendering of a tool call / result for the
+   * `tool_call` / `tool_result` variants. The latter is what the rolling
+   * summarizer sees, so keep it informative but bounded.
+   */
   content: string;
   createdAt: string; // ISO
+  /** Tool name; set on `tool_call` and `tool_result` entries only. */
+  toolName?: string;
+  /** Validated tool arguments; set on `tool_call` entries only. */
+  args?: unknown;
+  /**
+   * Tool result envelope (`{ ok, data | error }`); set on `tool_result`
+   * entries only. Shape mirrors `ToolResult<unknown>` from the agent
+   * package — kept loose here so `lib/types` stays free of agent imports.
+   */
+  result?: unknown;
 }
 
 export interface ChatSession {
@@ -19,6 +46,14 @@ export interface ChatSession {
   messages: ChatMessage[];
   /** Vault-relative path of transcript markdown file, if persisted. */
   transcriptPath?: string;
+  /**
+   * When true, this chat session routes turns through the agent
+   * orchestrator (tool calls + confirmations), instead of streaming a
+   * plain LLM completion. Default false so existing chats keep their
+   * current behavior; toggleable per-session for one release before the
+   * default flips.
+   */
+  agentEnabled?: boolean;
   /**
    * Rolling plain-prose summary of the head of the conversation. Injected as
    * a system message at the top of the next prompt so the model sees the
@@ -38,42 +73,6 @@ export interface ChatSession {
    * restart. Missing when no completion has been observed yet.
    */
   totalTokensUsed?: number;
-}
-
-/**
- * Domain-side capture intent. Mirrors the provider-level `Intent` type from
- * `lib/providers/llm/types`; kept here so the service result type doesn't
- * leak the provider package as an import requirement on its consumers.
- */
-export type CaptureIntent =
-  | "note"
-  | "create_task"
-  | "complete_task"
-  | "search"
-  | "ask_vault_question"
-  | "find_file"
-  | "open_file_for_task"
-  | "unknown";
-
-export type CaptureStatus =
-  | "ok"
-  | "ambiguous"
-  | "not_found"
-  | "needs_confirmation"
-  | "error";
-
-export interface CaptureActionResult {
-  intent: CaptureIntent;
-  status: CaptureStatus;
-  /** Conversational message to show to the user. */
-  message: string;
-  /** Optional structured details about what happened. */
-  details?: Record<string, unknown>;
-  /**
-   * Vault-relative path of the raw capture log written before the request was
-   * classified. Always present for inputs that were persisted (text + voice).
-   */
-  rawLogPath?: string;
 }
 
 export interface VoiceLogResult {

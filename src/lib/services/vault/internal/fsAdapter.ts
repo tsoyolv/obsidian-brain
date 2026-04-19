@@ -35,6 +35,8 @@ const SAFE_FS_OPS = Object.freeze({
   /** Atomic on the same filesystem; used by softDelete and moveFile. */
   rename: fs.rename.bind(fs),
   readdir: fs.readdir.bind(fs),
+  /** Read-only metadata; used by searchService to key its headings cache. */
+  stat: fs.stat.bind(fs),
 });
 
 /**
@@ -98,6 +100,22 @@ export async function ensureDir(absPath: string): Promise<void> {
  */
 export async function move(srcAbs: string, destAbs: string): Promise<void> {
   await SAFE_FS_OPS.rename(srcAbs, destAbs);
+}
+
+export interface FileStat {
+  /** Last-modification time as fractional milliseconds since epoch. */
+  mtimeMs: number;
+  /** File size in bytes. */
+  size: number;
+}
+
+/**
+ * Read-only metadata lookup. Throws if the path doesn't exist (or isn't
+ * accessible) — the caller decides whether to treat that as a soft failure.
+ */
+export async function statFile(absPath: string): Promise<FileStat> {
+  const s = await SAFE_FS_OPS.stat(absPath);
+  return { mtimeMs: s.mtimeMs, size: s.size };
 }
 
 export interface DirEntry {

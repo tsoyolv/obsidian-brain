@@ -1,7 +1,7 @@
 import type {
   ChatInput,
   ChatResponse,
-  IntentResult,
+  ChatUsage,
   LLMMessage,
   StreamDelta,
 } from "./dto";
@@ -10,29 +10,63 @@ export type {
   ChatInput,
   ChatResponse,
   ChatUsage,
-  Intent,
-  IntentDataMap,
-  IntentResult,
   LLMMessage,
   StreamDelta,
 } from "./dto";
+
+// ---- Tool calling ----
+
+/**
+ * Provider-agnostic descriptor for a tool the LLM may call. Mirrors the
+ * shape modern function/tool-calling APIs converge on (OpenAI, Anthropic,
+ * Gemini): a name, a human-readable description, and a JSON Schema for the
+ * argument object.
+ *
+ * `parameters` MUST be a JSON Schema object describing the argument
+ * envelope (typically `{ type: "object", properties: { ... }, required: [...] }`).
+ */
+export interface ToolDescriptor {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+/**
+ * One frame from a tool-calling chat stream.
+ *
+ *   - `message_delta` — incremental assistant text (when the model talks
+ *     instead of calling a tool, or talks before/after a tool call)
+ *   - `tool_call`     — the model decided to call a tool. `toolCall.args`
+ *     is the JSON the model produced; the orchestrator MUST validate it
+ *     against the tool's zod schema before invoking the tool.
+ *   - `done`          — terminal frame, optionally carrying usage
+ *
+ * Providers SHOULD emit at most one `tool_call` per turn (single-tool MVP);
+ * additional tool-call frames are ignored by the orchestrator.
+ */
+export interface ToolChatFrame {
+  type: "message_delta" | "tool_call" | "done";
+  delta?: string;
+  toolCall?: { name: string; args: unknown };
+  usage?: ChatUsage;
+}
 
 /**
  * Public LLM provider contract.
  *
  * The interface exposes a small set of HIGH-LEVEL operations:
  *  - sendMessage / streamMessage  — generic chat completion (DTO in / out)
- *  - classifyIntent               — parse a free-form user request into a typed intent
+ *  - chatWithTools                — single-turn tool-calling chat used by the agent loop
  *  - summarize                    — turn a chat transcript into structured markdown
  *  - rankFileCandidates           — pick the best vault file from a candidate list
  *  - runFileTask                  — run a typed task (summarize / extract / answer
  *                                    / generate_tasks) against a single confirmed file
  *
- * The DTOs in `./dto` ({@link ChatInput}, {@link ChatResponse},
- * {@link IntentResult}) are deliberately provider-agnostic. Provider-
- * specific concerns (response_format tricks, per-model token limits, prompt
- * tuning) stay inside implementations so services never branch on the
- * backend they happen to be wired to.
+ * The DTOs in `./dto` ({@link ChatInput}, {@link ChatResponse}) are
+ * deliberately provider-agnostic. Provider-specific concerns
+ * (response_format tricks, per-model token limits, prompt tuning) stay
+ * inside implementations so services never branch on the backend they
+ * happen to be wired to.
  */
 
 // ---- Summarization ----
@@ -148,7 +182,19 @@ export interface LLMProvider {
    * consumers should treat stream completion as end-of-message regardless.
    */
   streamMessage(input: ChatInput): AsyncIterable<StreamDelta>;
-  classifyIntent(input: string): Promise<IntentResult>;
+  /**
+   * Tool-calling chat. The provider exposes the supplied tools to the
+   * model and either streams plain assistant text (`message_delta` frames)
+   * or surfaces a `tool_call` frame the orchestrator must dispatch.
+   *
+   * Implementations MUST NOT execute the tool themselves — the orchestrator
+   * owns validation, confirmation, and dispatch. A `done` frame always
+   * terminates the stream.
+   */
+  chatWithTools(
+    input: ChatInput,
+    tools: ToolDescriptor[]
+  ): AsyncIterable<ToolChatFrame>;
   summarize(input: SummaryInput): Promise<SummaryResult>;
   /**
    * Rank a list of vault file candidates against a user query (and optional
