@@ -3,7 +3,7 @@ import { getConfig } from "@/lib/config";
 import { ensureMarkdownExt } from "@/lib/utils/filenames";
 import { createLogger } from "@/lib/utils/logger";
 import { parseMarkdown, serializeMarkdown } from "@/lib/markdown/frontmatter";
-import type { NoteFrontmatter, SearchHit } from "@/lib/types";
+import type { NoteFrontmatter } from "@/lib/types";
 import {
   appendUtf8,
   ensureDir,
@@ -22,11 +22,6 @@ import {
   toVaultRelative,
   withTimestampSuffix,
 } from "./internal/paths";
-import {
-  makeSnippet,
-  scoreDocument,
-  tokenize,
-} from "./internal/search";
 import { walkMarkdown } from "./internal/walker";
 
 const log = createLogger("vaultService");
@@ -34,6 +29,7 @@ const log = createLogger("vaultService");
 export const VAULT_FOLDERS = {
   inbox: "Inbox",
   voiceLogs: "Voice Logs",
+  captureLogs: "Capture Logs",
   aiChats: "AI Chats",
   aiSummaries: "AI Summaries",
   tasks: "Tasks",
@@ -46,10 +42,39 @@ export type VaultFolder = (typeof VAULT_FOLDERS)[keyof typeof VAULT_FOLDERS];
  * startup — created lazily on first soft-delete so that vaults without any
  * deletions don't accumulate empty trash directories.
  *
- * Excluded from `listFiles()` and `searchNotes()` when invoked at vault root.
- * Callers can still inspect it explicitly by passing it as the `folder` arg.
+ * Excluded from `listFiles()` (and therefore from `searchService.search` and
+ * `findFilesByName`) when invoked at vault root. Callers can still inspect
+ * it explicitly by passing it as the `folder` argument.
  */
 export const DELETED_FOLDER = "Deleted";
+
+/**
+ * Allowlist of TOP-LEVEL vault folders that ANY mutating vault operation is
+ * permitted to write into. Anything outside this set — including the vault
+ * root itself or arbitrary user-supplied folders — is rejected at the
+ * service boundary, so a misbehaving classifier or a buggy caller cannot
+ * scribble into `.obsidian/`, attached subfolders, or unrelated trees.
+ *
+ * `Deleted/` is INTENTIONALLY excluded: the only way to land a file there is
+ * via {@link VaultService.softDelete}, which uses a private code path.
+ */
+export const WRITABLE_FOLDERS: ReadonlySet<string> = new Set(
+  Object.values(VAULT_FOLDERS)
+);
+
+/**
+ * Mutation kinds that go through the writable-folder check. Used in error
+ * messages so a violation makes it obvious which API call was rejected.
+ */
+type MutationKind =
+  | "createNote"
+  | "ensureNoteExists"
+  | "appendToNote"
+  | "writeRawNote"
+  | "replaceLine"
+  | "updateFrontmatter"
+  | "moveFile"
+  | "softDelete";
 
 export interface CreateNoteInput {
   folder: string;
@@ -71,12 +96,6 @@ export interface ParsedNote {
   body: string;
 }
 
-export interface SearchOptions {
-  limit?: number;
-  /** Restrict search to a folder (vault-relative). */
-  folder?: string;
-}
-
 export interface MoveFileOptions {
   /** If true, append a timestamp suffix on filename collision instead of throwing. */
   uniqueOnConflict?: boolean;
@@ -90,6 +109,21 @@ export interface MoveFileResult {
 export interface SoftDeleteResult {
   /** Vault-relative path inside `Deleted/` where the file now lives. */
   path: string;
+}
+
+export interface FileMatch {
+  /** Vault-relative path. */
+  path: string;
+  /** File basename without `.md`. */
+  title: string;
+  /** Higher = better. Pure filename score; never reads file body. */
+  score: number;
+}
+
+export interface FindFilesOptions {
+  limit?: number;
+  /** Restrict the search to a folder (vault-relative). */
+  folder?: string;
 }
 
 /**
@@ -117,6 +151,13 @@ export interface VaultService {
   writeRawNote(relPath: string, raw: string): Promise<void>;
   /** Replace a single 1-based line in a note. Used for safe in-place edits. */
   replaceLine(relPath: string, line1Based: number, newLine: string): Promise<void>;
+  /**
+   * Merge `partial` into the note's existing YAML frontmatter, preserving
+   * the body byte-for-byte. Keys set to `undefined` in `partial` are
+   * removed; keys not mentioned are left untouched. No-op when the merged
+   * frontmatter is deep-equal to the existing one (avoids mtime churn).
+   */
+  updateFrontmatter(relPath: string, partial: NoteFrontmatter): Promise<void>;
 
   // Mutation
   moveFile(
@@ -132,8 +173,19 @@ export interface VaultService {
   softDelete(relPath: string): Promise<SoftDeleteResult>;
 
   // Discovery
+  /**
+   * Recursively list every `.md` file under `folder` (or the vault root if
+   * omitted). The vault's `Deleted/` subtree is pruned at the root, so
+   * soft-deleted files never appear unless `folder: "Deleted"` is passed
+   * explicitly.
+   */
   listFiles(folder?: string): Promise<string[]>;
-  searchNotes(query: string, options?: SearchOptions): Promise<SearchHit[]>;
+  /**
+   * Filename-only fuzzy match. Walks the vault but NEVER reads file bodies —
+   * safe to use for "find_file" style flows where we must not surface note
+   * content without explicit user confirmation.
+   */
+  findFilesByName(query: string, options?: FindFilesOptions): Promise<FileMatch[]>;
 }
 
 class VaultServiceImpl implements VaultService {
@@ -167,6 +219,7 @@ class VaultServiceImpl implements VaultService {
 
   async createNote(input: CreateNoteInput): Promise<CreateNoteResult> {
     const folderRel = sanitizeRelFolder(input.folder);
+    this.assertWritableFolder(folderRel, "createNote");
     const baseFilename = ensureMarkdownExt(input.title);
     const folderAbs = this.resolve(folderRel);
     await ensureDir(folderAbs);
@@ -193,6 +246,7 @@ class VaultServiceImpl implements VaultService {
   }
 
   async ensureNoteExists(relPath: string, initialContent: string): Promise<void> {
+    this.assertWritablePath(relPath, "ensureNoteExists");
     const abs = this.resolve(relPath);
     if (await pathExists(abs)) return;
     await ensureDir(this.resolve(dirnameOf(relPath)));
@@ -201,6 +255,7 @@ class VaultServiceImpl implements VaultService {
   }
 
   async appendToNote(relPath: string, content: string): Promise<void> {
+    this.assertWritablePath(relPath, "appendToNote");
     const abs = this.resolve(relPath);
     if (!(await pathExists(abs))) {
       throw new Error(`Note not found for append: ${relPath}`);
@@ -220,6 +275,7 @@ class VaultServiceImpl implements VaultService {
   }
 
   async writeRawNote(relPath: string, raw: string): Promise<void> {
+    this.assertWritablePath(relPath, "writeRawNote");
     const abs = this.resolve(relPath);
     await ensureDir(this.resolve(dirnameOf(relPath)));
     await writeUtf8(abs, ensureTrailingNewline(raw));
@@ -230,6 +286,7 @@ class VaultServiceImpl implements VaultService {
     line1Based: number,
     newLine: string
   ): Promise<void> {
+    this.assertWritablePath(relPath, "replaceLine");
     const abs = this.resolve(relPath);
     const raw = await readUtf8(abs);
     const lines = raw.split(/\r?\n/);
@@ -243,6 +300,31 @@ class VaultServiceImpl implements VaultService {
     log.debug("replaceLine", { path: relPath, line: line1Based });
   }
 
+  async updateFrontmatter(
+    relPath: string,
+    partial: NoteFrontmatter
+  ): Promise<void> {
+    this.assertWritablePath(relPath, "updateFrontmatter");
+    const abs = this.resolve(relPath);
+    if (!(await pathExists(abs))) {
+      throw new Error(`Note not found for frontmatter update: ${relPath}`);
+    }
+    const raw = await readUtf8(abs);
+    const { data, body } = parseMarkdown(raw);
+    const merged: NoteFrontmatter = { ...data };
+    for (const [k, v] of Object.entries(partial)) {
+      if (v === undefined) {
+        delete merged[k];
+      } else {
+        merged[k] = v;
+      }
+    }
+    const next = serializeMarkdown(body, merged);
+    if (next === raw) return;
+    await writeUtf8(abs, next);
+    log.debug("updateFrontmatter", { path: relPath });
+  }
+
   async moveFile(
     srcRelPath: string,
     destRelPath: string,
@@ -250,6 +332,13 @@ class VaultServiceImpl implements VaultService {
   ): Promise<MoveFileResult> {
     const safeSrc = sanitizeRelPath(srcRelPath);
     const safeDest = sanitizeRelPath(destRelPath);
+    // Both endpoints of a move must live under the writable allowlist. In
+    // particular, this rejects moves into `Deleted/` — the only legitimate
+    // way to write into the trash is `softDelete`, which uses a separate
+    // private code path below.
+    this.assertWritablePath(safeSrc, "moveFile");
+    this.assertWritablePath(safeDest, "moveFile");
+
     if (safeSrc === safeDest) {
       return { path: safeSrc };
     }
@@ -280,6 +369,11 @@ class VaultServiceImpl implements VaultService {
 
   async softDelete(relPath: string): Promise<SoftDeleteResult> {
     const safeRel = sanitizeRelPath(relPath);
+    // Source must come from a writable folder. We deliberately do NOT call
+    // assertWritablePath on the destination because the destination is, by
+    // construction, inside `Deleted/` — softDelete is the SOLE entry point
+    // permitted to write there.
+    this.assertWritablePath(safeRel, "softDelete");
     const srcAbs = this.resolve(safeRel);
     if (!(await pathExists(srcAbs))) {
       throw new Error(`Cannot soft-delete; not found: ${relPath}`);
@@ -305,6 +399,49 @@ class VaultServiceImpl implements VaultService {
     return { path: finalRel };
   }
 
+  /**
+   * Reject any mutating operation whose target path is not inside the
+   * writable allowlist (or is inside `Deleted/`). Defense-in-depth on top
+   * of {@link sanitizeRelPath}, which already rejects traversal — this
+   * layer additionally limits WHICH allowed-by-traversal folders may be
+   * written.
+   */
+  private assertWritablePath(relPath: string, op: MutationKind): void {
+    const safeRel = sanitizeRelPath(relPath);
+    const top = topLevelSegment(safeRel);
+    this.assertWritableTop(top, op, safeRel);
+  }
+
+  /** Folder-only variant — used by `createNote` which validates the folder before composing the filename. */
+  private assertWritableFolder(folderRel: string, op: MutationKind): void {
+    const top = topLevelSegment(folderRel);
+    this.assertWritableTop(top, op, folderRel);
+  }
+
+  private assertWritableTop(
+    top: string | undefined,
+    op: MutationKind,
+    target: string
+  ): void {
+    if (!top) {
+      throw new Error(
+        `Refusing ${op}: writes to the vault root are not allowed (target: "${target}")`
+      );
+    }
+    if (top === DELETED_FOLDER) {
+      throw new Error(
+        `Refusing ${op}: ${DELETED_FOLDER}/ is write-protected. ` +
+          `Use softDelete to move files there.`
+      );
+    }
+    if (!WRITABLE_FOLDERS.has(top)) {
+      throw new Error(
+        `Refusing ${op}: "${top}" is not in the writable folder allowlist ` +
+          `(${[...WRITABLE_FOLDERS].sort().join(", ")}). target="${target}"`
+      );
+    }
+  }
+
   async listFiles(folder?: string): Promise<string[]> {
     const start = folder ? this.resolve(sanitizeRelFolder(folder)) : this.root;
     const files = await walkMarkdown(start, {
@@ -313,11 +450,11 @@ class VaultServiceImpl implements VaultService {
     return files.map((abs) => toVaultRelative(this.root, abs));
   }
 
-  async searchNotes(
+  async findFilesByName(
     query: string,
-    options: SearchOptions = {}
-  ): Promise<SearchHit[]> {
-    const limit = options.limit ?? 25;
+    options: FindFilesOptions = {}
+  ): Promise<FileMatch[]> {
+    const limit = options.limit ?? 10;
     const tokens = tokenize(query);
     if (tokens.length === 0) return [];
 
@@ -327,28 +464,20 @@ class VaultServiceImpl implements VaultService {
     const files = await walkMarkdown(startAbs, {
       skipPaths: options.folder ? undefined : this.deletedSkipSet(),
     });
-    const results: SearchHit[] = [];
 
+    const matches: FileMatch[] = [];
     for (const abs of files) {
-      let content: string;
-      try {
-        content = await readUtf8(abs);
-      } catch {
-        continue;
-      }
       const title = basenameWithoutExt(abs);
-      const score = scoreDocument({ title, content, tokens });
+      const score = scoreFilename(title, tokens);
       if (score === 0) continue;
-      results.push({
+      matches.push({
         path: toVaultRelative(this.root, abs),
         title,
-        snippet: makeSnippet(content, tokens),
         score,
       });
     }
-
-    results.sort((a, b) => b.score - a.score);
-    return results.slice(0, limit);
+    matches.sort((a, b) => b.score - a.score);
+    return matches.slice(0, limit);
   }
 
   /** Internal: turn a vault-relative path into a guaranteed-safe absolute path. */
@@ -379,4 +508,46 @@ export function _resetVaultServiceCache(): void {
 
 function ensureTrailingNewline(s: string): string {
   return s.endsWith("\n") ? s : `${s}\n`;
+}
+
+/**
+ * First path segment of a vault-relative path, used to gate writes against
+ * {@link WRITABLE_FOLDERS}. Returns undefined ONLY when the path is empty —
+ * a single-segment path (e.g. the folder name itself, or a bare filename
+ * being written to the vault root) returns that segment so the allowlist
+ * check can decide whether it's permitted.
+ */
+function topLevelSegment(relPath: string): string | undefined {
+  const segments = relPath.split(path.sep).filter(Boolean);
+  if (segments.length === 0) return undefined;
+  return segments[0];
+}
+
+/**
+ * Lowercase tokens of length >= 2. Latin + cyrillic friendly so mixed
+ * English/Russian filenames tokenize the same way.
+ */
+function tokenize(query: string): string[] {
+  return query
+    .toLowerCase()
+    .split(/[^a-z0-9_\-а-яё]+/i)
+    .filter((s) => s.length >= 2);
+}
+
+/**
+ * Filename-only score. Tuned to favor full-substring hits over scattered
+ * token coverage so renames like "shopping list" beat unrelated files that
+ * happen to share one of the words.
+ */
+function scoreFilename(title: string, tokens: string[]): number {
+  if (tokens.length === 0) return 0;
+  const hay = title.toLowerCase();
+  const phrase = tokens.join(" ").toLowerCase();
+  let score = 0;
+  if (hay === phrase) score += 100;
+  if (hay.includes(phrase)) score += 30;
+  for (const t of tokens) {
+    if (hay.includes(t)) score += 4;
+  }
+  return score;
 }

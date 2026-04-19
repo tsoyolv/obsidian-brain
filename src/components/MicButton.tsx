@@ -7,6 +7,12 @@ interface Props {
   onRecorded: (blob: Blob, mimeType: string) => void;
   disabled?: boolean;
   className?: string;
+  /** Label shown when idle (before recording starts). Defaults to "Record". */
+  idleLabel?: string;
+  /** Title attribute when idle — useful when two MicButtons sit next to each other. */
+  idleTitle?: string;
+  /** Visual variant for the idle state. */
+  variant?: "default" | "primary";
 }
 
 /**
@@ -14,15 +20,28 @@ interface Props {
  * - First click: starts recording.
  * - Second click: stops recording and emits the blob.
  *
+ * While recording, displays a live MM:SS timer so the user knows the
+ * capture is actually active.
+ *
  * Supported in modern browsers; for unsupported browsers the button is disabled.
  */
-export function MicButton({ onRecorded, disabled, className }: Props) {
+export function MicButton({
+  onRecorded,
+  disabled,
+  className,
+  idleLabel = "Record",
+  idleTitle,
+  variant = "default",
+}: Props) {
   const [recording, setRecording] = useState(false);
   const [supported, setSupported] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const [elapsedSec, setElapsedSec] = useState(0);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
+  const startedAtRef = useRef<number>(0);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -35,6 +54,7 @@ export function MicButton({ onRecorded, disabled, className }: Props) {
   useEffect(() => {
     return () => {
       streamRef.current?.getTracks().forEach((t) => t.stop());
+      if (timerRef.current) clearInterval(timerRef.current);
     };
   }, []);
 
@@ -55,10 +75,20 @@ export function MicButton({ onRecorded, disabled, className }: Props) {
         chunksRef.current = [];
         streamRef.current?.getTracks().forEach((t) => t.stop());
         streamRef.current = null;
+        if (timerRef.current) {
+          clearInterval(timerRef.current);
+          timerRef.current = null;
+        }
+        setElapsedSec(0);
         onRecorded(blob, type);
       };
       recorderRef.current = rec;
       rec.start();
+      startedAtRef.current = Date.now();
+      setElapsedSec(0);
+      timerRef.current = setInterval(() => {
+        setElapsedSec(Math.floor((Date.now() - startedAtRef.current) / 1000));
+      }, 250);
       setRecording(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Microphone unavailable");
@@ -85,21 +115,25 @@ export function MicButton({ onRecorded, disabled, className }: Props) {
     );
   }
 
+  const idleClass = variant === "primary" ? "btn-primary" : "btn";
+
   return (
     <div className={`flex items-center gap-2 ${className ?? ""}`}>
       <button
         type="button"
         onClick={recording ? stop : start}
         disabled={disabled}
-        className={recording ? "btn-primary" : "btn"}
+        title={recording ? "Stop recording" : idleTitle ?? idleLabel}
+        className={recording ? "btn-primary" : idleClass}
       >
         {recording ? (
           <>
             <span className="recording-dot inline-block h-2 w-2 rounded-full bg-white" />
-            Stop
+            <span className="tabular-nums">{formatElapsed(elapsedSec)}</span>
+            <span className="ml-1">Stop</span>
           </>
         ) : (
-          <>🎙 Record</>
+          <>🎙 {idleLabel}</>
         )}
       </button>
       {error ? <span className="text-xs text-red-400">{error}</span> : null}
@@ -119,4 +153,10 @@ function pickMimeType(): string | undefined {
     if (MediaRecorder.isTypeSupported(c)) return c;
   }
   return undefined;
+}
+
+function formatElapsed(totalSec: number): string {
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
 }

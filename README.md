@@ -18,8 +18,11 @@ transcripts and optional summaries.
 - **Capture tab** – chat-style quick input
   - typed text or recorded voice
   - intents: save note, create task, complete task, search notes,
-    ask vault question
+    ask vault question, find file (name only), open file for task
+    (with confirmation)
   - voice is transcribed and the raw transcript is saved immediately
+  - typed input is persisted as a raw capture log _before_ classification,
+    so nothing is lost if the LLM call fails
 - **Chat tab** – long-form AI conversations
   - multiple in-memory sessions
   - streaming assistant responses (SSE)
@@ -54,9 +57,10 @@ folders exist inside your `OBSIDIAN_VAULT_PATH`:
 <vault>/
 ├── Inbox/          # Saved notes from the Capture tab
 ├── Voice Logs/     # Raw STT transcripts (one per recording)
+├── Capture Logs/   # Raw text captures (one per typed request)
 ├── AI Chats/       # Full chat transcripts, one file per session
 ├── AI Summaries/   # Optional summary + action items per chat
-└── Tasks/          # Daily task files (e.g. 2026-04-19.md)
+└── Tasks/          # Task files (Inbox.md by default; daily / project files allowed)
 ```
 
 All files use YAML frontmatter where appropriate so they remain searchable in
@@ -118,6 +122,8 @@ Type something like:
 - `complete task buy milk`
 - `search project alpha`
 - `what did I write about Postgres replication?`
+- `find file shopping list`
+- `open my reading list to add Dune`
 
 Or click **Record**, speak, and click **Stop**. The recording is sent to
 the configured STT provider, the raw transcript is saved under
@@ -130,7 +136,36 @@ Each capture shows an explicit action result:
 - `Created task: "..."`
 - `Completed task: "..."`
 - `Found N matching notes` (with snippets)
-- `Need clarification: ...` when a task lookup is ambiguous
+- `Found N files matching "..."` — for `find_file`, names only, no body read
+- `Found "<file>". Confirm to open it for "<task>".` — for `open_file_for_task`
+- `Need clarification: ...` when a task or file lookup is ambiguous
+
+### Capture pipeline
+
+Every typed request goes through four well-defined stages:
+
+1. **Input** — the user's raw string (typed or transcribed from voice).
+2. **Save raw note** — the input is written to `Capture Logs/<stamp>.md`
+   _before_ any LLM call, so nothing is lost on transient failures.
+3. **Classify intent** — the LLM is forced to return strict JSON shaped
+   `{ "intent": "...", "data": { ... } }`. The provider validates the JSON
+   against a per-intent zod schema; malformed responses are coerced to
+   `{ intent: "unknown" }`.
+4. **Execute** — the matching business action runs. The classifier and the
+   business layer are completely separate; the LLM has no filesystem access.
+
+#### Safety rules baked into the pipeline
+
+- **Never deletes files.** The vault module exposes no unlink API; the only
+  destructive operation is `softDelete`, which moves files into `Deleted/`.
+- **Never reads a full file without confirmation.**
+  - `find_file` walks the vault but only inspects file _names_; bodies are
+    never opened.
+  - `open_file_for_task` surfaces the matched file path and returns
+    `status: "needs_confirmation"`. The body is read only after a follow-up
+    confirmation from the user.
+  - `ask_vault_question` reads at most the first ~1500 characters of each of
+    the top-N keyword-matched notes — bounded partial reads only.
 
 ### Chat tab
 
@@ -245,6 +280,37 @@ The same pattern applies to `STTProvider`.
 - Filenames are sanitized to remove path separators, control characters and
   characters illegal on Windows/macOS.
 - Voice uploads are capped at 25 MB.
+
+#### Filesystem-level safety enforcement
+
+The vault layer enforces three structural invariants — no business action
+can violate them, even by accident:
+
+1. **No delete, ever.** `node:fs` is imported in exactly one file
+   (`src/lib/services/vault/internal/fsAdapter.ts`). That file exposes a
+   frozen whitelist of allowed primitives (`access`, `readFile`,
+   `writeFile`, `appendFile`, `mkdir`, `rename`, `readdir`) and runs a
+   module-load assertion that crashes the process if any name matching
+   `unlink | rm | rmdir | remove | delete | truncate | cp` ever leaks into
+   the whitelist via a refactor. `unlink`/`rm`/`rmdir` are simply
+   unreachable from the rest of the codebase.
+
+2. **Soft delete is the only destructive operation.** The strongest
+   mutation `vaultService` exposes is `softDelete(relPath)`, which performs
+   an atomic `rename` into `Deleted/<original-relative-path>`. Files leave
+   `Inbox/`, `Tasks/`, etc. and reappear under `Deleted/` with their
+   folder structure preserved; the disk bytes are never freed by the app.
+   `moveFile` cannot land files in `Deleted/` — that path is reserved for
+   `softDelete`.
+
+3. **Writable-folder allowlist.** Every mutating call (`createNote`,
+   `ensureNoteExists`, `appendToNote`, `writeRawNote`, `replaceLine`,
+   `updateFrontmatter`, `moveFile`, `softDelete`) checks the target's
+   top-level segment against `WRITABLE_FOLDERS`:
+   `Inbox`, `Voice Logs`, `Capture Logs`, `AI Chats`, `AI Summaries`,
+   `Tasks`. Writes to the vault root, to `Deleted/`, to `.obsidian/`, or
+   to any other arbitrary folder are rejected with a loud error before
+   any I/O happens.
 
 ---
 

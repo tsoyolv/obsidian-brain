@@ -1,9 +1,12 @@
 import OpenAI, { toFile } from "openai";
+import { createLogger } from "@/lib/utils/logger";
 import type {
   STTProvider,
   TranscriptionInput,
   TranscriptionResult,
 } from "./types";
+
+const log = createLogger("openai-stt");
 
 export interface OpenAISTTProviderOptions {
   apiKey: string;
@@ -22,19 +25,49 @@ export class OpenAISTTProvider implements STTProvider {
 
   async transcribe(input: TranscriptionInput): Promise<TranscriptionResult> {
     const model = input.model ?? this.defaultModel;
+    const audioBytes = input.audio.length;
+    const t = log.time("transcribe");
+    log.debug("transcribe: start", {
+      model,
+      filename: input.filename,
+      mimeType: input.mimeType,
+      language: input.language,
+      audioBytes,
+    });
+
     const file = await toFile(input.audio, input.filename, {
       type: input.mimeType,
     });
 
-    const result = await this.client.audio.transcriptions.create({
+    let result;
+    try {
+      result = await this.client.audio.transcriptions.create({
+        model,
+        file,
+        language: input.language,
+        response_format: "json",
+      });
+    } catch (err) {
+      t.fail("transcribe: provider error", {
+        model,
+        filename: input.filename,
+        audioBytes,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
+
+    const text = result.text ?? "";
+    t.done("transcribe", {
       model,
-      file,
+      audioBytes,
+      transcriptChars: text.length,
+      empty: text.length === 0,
       language: input.language,
-      response_format: "json",
     });
 
     return {
-      text: result.text ?? "",
+      text,
       model,
       provider: this.id,
       language: input.language,

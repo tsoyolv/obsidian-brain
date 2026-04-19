@@ -1,10 +1,16 @@
 import { getVaultService, VAULT_FOLDERS } from "@/lib/services/vault";
 import { task as renderTask } from "@/lib/markdown/helpers";
 import { ensureMarkdownExt } from "@/lib/utils/filenames";
-import { todayLocalDate } from "@/lib/utils/id";
 import { createLogger } from "@/lib/utils/logger";
 
 const log = createLogger("taskService");
+
+/**
+ * Default vault-relative file new tasks land in when the caller doesn't
+ * specify one. Plain markdown so it shows up cleanly in Obsidian.
+ */
+export const DEFAULT_TASK_FILE = `${VAULT_FOLDERS.tasks}/Inbox.md`;
+const DEFAULT_TASK_FILE_HEADER = `# Tasks Inbox\n\n`;
 
 export interface TaskHit {
   /** Vault-relative path. */
@@ -18,7 +24,10 @@ export interface TaskHit {
 }
 
 export interface CreateTaskInput {
-  /** Vault-relative path. If omitted, defaults to `Tasks/<today>.md`. */
+  /**
+   * Vault-relative path. If omitted, defaults to `Tasks/Inbox.md`.
+   * The file is created (with a heading) if it doesn't exist yet.
+   */
   targetFile?: string;
   text: string;
 }
@@ -34,12 +43,27 @@ export type CompleteTaskResult =
   | { status: "not_found" };
 
 export interface TaskService {
+  /** Append `- [ ] <text>` to `targetFile` (default `Tasks/Inbox.md`). */
   createTask(input: CreateTaskInput): Promise<CreateTaskResult>;
+  /**
+   * Fuzzy-match an OPEN task by `searchText`. If exactly one strong match is
+   * found it is checked off and returned. Multiple near-ties yield
+   * `{ status: "ambiguous" }`; no matches yields `{ status: "not_found" }`.
+   * NEVER touches files in the vault's `Deleted/` subtree.
+   */
   completeTask(searchText: string): Promise<CompleteTaskResult>;
+  /** Fuzzy-search across ALL tasks (open + done). Pass empty `query` to list. */
   findTasks(query: string): Promise<TaskHit[]>;
+  /** All open `- [ ]` tasks across the vault, in walk order. */
   listOpenTasks(): Promise<TaskHit[]>;
 }
 
+/**
+ * Recognised task line formats:
+ *   - [ ] do something
+ *   * [x] done thing
+ * Indentation, `-`/`*` bullet, and lower/upper-case `x` are all accepted.
+ */
 const TASK_LINE_RE = /^(\s*)([-*])\s+\[( |x|X)\]\s+(.+?)\s*$/;
 
 class TaskServiceImpl implements TaskService {
@@ -47,49 +71,92 @@ class TaskServiceImpl implements TaskService {
 
   async createTask(input: CreateTaskInput): Promise<CreateTaskResult> {
     const text = input.text.trim();
-    if (!text) throw new Error("Task text must not be empty");
+    if (!text) {
+      log.warn("createTask: empty text");
+      throw new Error("Task text must not be empty");
+    }
 
-    const targetRel =
-      input.targetFile ??
-      this.vault.joinPath(VAULT_FOLDERS.tasks, ensureMarkdownExt(todayLocalDate()));
+    const targetRel = input.targetFile
+      ? this.vault.safePathResolve(ensureMarkdownExt(input.targetFile))
+      : DEFAULT_TASK_FILE;
 
-    await this.vault.ensureNoteExists(
-      targetRel,
-      `# Tasks ${todayLocalDate()}\n\n`
-    );
-    await this.vault.appendToNote(targetRel, renderTask(text, false));
+    const t = log.time("createTask");
+    try {
+      await this.vault.ensureNoteExists(targetRel, DEFAULT_TASK_FILE_HEADER);
+      await this.vault.appendToNote(targetRel, renderTask(text, false));
+    } catch (err) {
+      t.fail("createTask: write failed", {
+        path: targetRel,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
 
-    log.info("createTask", { path: targetRel, text });
+    t.done("createTask", { path: targetRel, text, chars: text.length });
     return { path: targetRel, text };
   }
 
   async completeTask(searchText: string): Promise<CompleteTaskResult> {
     const needle = searchText.trim().toLowerCase();
-    if (!needle) return { status: "not_found" };
+    if (!needle) {
+      log.warn("completeTask: empty needle");
+      return { status: "not_found" };
+    }
 
-    const all = await this.collectTasks({ openOnly: true });
-    const matches = fuzzyMatch(all, needle);
+    const t = log.time("completeTask");
+    const open = await this.collectTasks({ openOnly: true });
+    const matches = fuzzyMatch(open, needle);
 
-    if (matches.length === 0) return { status: "not_found" };
-    if (matches.length > 1) return { status: "ambiguous", matches: matches.slice(0, 5) };
+    if (matches.length === 0) {
+      t.done("completeTask: no match", {
+        needle,
+        scannedOpen: open.length,
+        status: "not_found",
+      });
+      return { status: "not_found" };
+    }
+    if (matches.length > 1) {
+      t.done("completeTask: ambiguous", {
+        needle,
+        matches: matches.length,
+        status: "ambiguous",
+      });
+      return { status: "ambiguous", matches: matches.slice(0, 5) };
+    }
 
     const hit = matches[0]!;
     await this.markTaskDone(hit);
-    log.info("completeTask", { path: hit.path, line: hit.line });
+    t.done("completeTask", {
+      path: hit.path,
+      line: hit.line,
+      text: hit.text,
+      status: "ok",
+    });
     return { status: "ok", hit: { ...hit, done: true } };
   }
 
   async findTasks(query: string): Promise<TaskHit[]> {
     const needle = query.trim().toLowerCase();
+    const t = log.time("findTasks");
     const all = await this.collectTasks({ openOnly: false });
-    if (!needle) return all.slice(0, 50);
-    return fuzzyMatch(all, needle).slice(0, 50);
+    const out = !needle ? all.slice(0, 50) : fuzzyMatch(all, needle).slice(0, 50);
+    t.done("findTasks", { needle, scanned: all.length, returned: out.length });
+    return out;
   }
 
   async listOpenTasks(): Promise<TaskHit[]> {
-    return this.collectTasks({ openOnly: true });
+    const t = log.time("listOpenTasks");
+    const open = await this.collectTasks({ openOnly: true });
+    t.done("listOpenTasks", { count: open.length });
+    return open;
   }
 
+  /**
+   * Walk every markdown file in the vault and parse out task lines.
+   * `vault.listFiles()` invoked without a folder argument already prunes the
+   * `Deleted/` subtree, so soft-deleted tasks are silently ignored as
+   * required by the safety rules.
+   */
   private async collectTasks(opts: { openOnly: boolean }): Promise<TaskHit[]> {
     const files = await this.vault.listFiles();
     const out: TaskHit[] = [];
@@ -142,9 +209,18 @@ export function _resetTaskServiceCache(): void {
 // ---- helpers ----
 
 /**
- * Lightweight fuzzy match: scores tasks by token overlap and substring presence.
- * Returns a single clear winner when ahead by a margin, otherwise all near-ties
- * so the caller can disambiguate instead of guessing.
+ * Lightweight fuzzy match over task text.
+ *
+ * Scoring:
+ *   - exact case-insensitive match            → +100
+ *   - full-needle substring                   → +20
+ *   - per-token substring (cyrillic-friendly) → +4
+ *
+ * Returns:
+ *   - `[]`             when nothing scored
+ *   - `[winner]`       when the top score beats #2 by ≥ 5 points
+ *   - all near-ties    otherwise, so the caller can disambiguate instead of
+ *                      silently picking the wrong task
  */
 function fuzzyMatch(tasks: TaskHit[], needle: string): TaskHit[] {
   const tokens = needle

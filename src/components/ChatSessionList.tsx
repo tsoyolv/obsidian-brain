@@ -1,10 +1,14 @@
 "use client";
 
+import { SkeletonLines, Spinner } from "./Spinner";
+
 export interface SessionSummary {
   id: string;
   title: string;
   updatedAt: string;
   messageCount: number;
+  totalTokensUsed?: number;
+  nextPromptEstimateTokens?: number;
 }
 
 interface Props {
@@ -13,6 +17,7 @@ interface Props {
   onSelect: (id: string) => void;
   onCreate: () => void;
   creating?: boolean;
+  loading?: boolean;
 }
 
 export function ChatSessionList({
@@ -21,6 +26,7 @@ export function ChatSessionList({
   onSelect,
   onCreate,
   creating,
+  loading,
 }: Props) {
   return (
     <div className="flex h-full flex-col gap-2">
@@ -30,11 +36,26 @@ export function ChatSessionList({
         disabled={creating}
         className="btn-primary w-full"
       >
-        {creating ? "Creating…" : "+ New chat"}
+        {creating ? (
+          <>
+            <Spinner />
+            Creating…
+          </>
+        ) : (
+          "+ New chat"
+        )}
       </button>
       <div className="flex-1 overflow-y-auto rounded-xl border border-bg-border bg-bg-panel">
-        {sessions.length === 0 ? (
-          <div className="p-3 text-xs text-ink-dim">No sessions yet.</div>
+        {loading && sessions.length === 0 ? (
+          <div className="space-y-3 p-3">
+            <SkeletonLines lines={3} />
+            <SkeletonLines lines={3} />
+          </div>
+        ) : sessions.length === 0 ? (
+          <div className="p-3 text-xs text-ink-dim">
+            No sessions yet. Click <span className="text-ink">+ New chat</span>{" "}
+            to start one.
+          </div>
         ) : (
           <ul className="divide-y divide-bg-border">
             {sessions.map((s) => {

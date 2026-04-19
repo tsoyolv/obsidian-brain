@@ -4,8 +4,14 @@ import { createLogger } from "@/lib/utils/logger";
 import type {
   ChatInput,
   ChatResponse,
+  FileRankInput,
+  FileRankResult,
+  FileTaskInput,
+  FileTaskKind,
+  FileTaskOutput,
   IntentResult,
   LLMProvider,
+  StreamDelta,
   SummaryInput,
   SummaryResult,
 } from "./types";
@@ -46,7 +52,6 @@ export class OpenAIChatProvider implements LLMProvider {
     return {
       content,
       model,
-      provider: this.id,
       usage: completion.usage
         ? {
             promptTokens: completion.usage.prompt_tokens,
@@ -57,19 +62,62 @@ export class OpenAIChatProvider implements LLMProvider {
     };
   }
 
-  async *streamMessage(input: ChatInput): AsyncIterable<string> {
+  async *streamMessage(input: ChatInput): AsyncIterable<StreamDelta> {
     const model = input.model ?? this.defaultModel;
+    const debug = process.env.DEBUG_STREAM === "1";
+    // `include_usage` tells OpenAI to emit one extra final chunk with
+    // prompt_tokens / completion_tokens populated. Without it, streamed
+    // responses carry no usage at all and we'd need a separate estimator.
     const stream = await this.client.chat.completions.create({
       model,
       messages: input.messages.map((m) => ({ role: m.role, content: m.content })),
       temperature: input.temperature,
       max_tokens: input.maxOutputTokens,
       stream: true,
+      stream_options: { include_usage: true },
     });
 
+    let chunkIndex = 0;
+    const startedAt = Date.now();
+    let finalUsage: StreamDelta["usage"];
     for await (const part of stream) {
       const delta = part.choices[0]?.delta?.content;
-      if (delta) yield delta;
+      if (part.usage) {
+        // OpenAI returns `prompt_tokens_details.cached_tokens` whenever
+        // automatic prompt caching kicks in (stable prefix ≥ 1024 tokens).
+        // The field isn't always present on the SDK type, hence the cast.
+        const details = (
+          part.usage as unknown as {
+            prompt_tokens_details?: { cached_tokens?: number };
+          }
+        ).prompt_tokens_details;
+        finalUsage = {
+          promptTokens: part.usage.prompt_tokens,
+          completionTokens: part.usage.completion_tokens,
+          totalTokens: part.usage.total_tokens,
+          cachedPromptTokens: details?.cached_tokens,
+        };
+      }
+      if (delta) {
+        if (debug) {
+          const dt = Date.now() - startedAt;
+          log.debug(
+            `chunk #${chunkIndex} +${dt}ms ${JSON.stringify(delta)}`
+          );
+        }
+        chunkIndex += 1;
+        yield { delta };
+      }
+    }
+    // Emit a terminal frame carrying real token usage (if the provider
+    // delivered it). Deltas are empty so consumers that only append
+    // `delta` to a buffer won't be disturbed.
+    yield { delta: "", usage: finalUsage };
+    if (debug) {
+      log.debug(
+        `stream done: ${chunkIndex} chunks in ${Date.now() - startedAt}ms`,
+        { usage: finalUsage }
+      );
     }
   }
 
@@ -93,20 +141,118 @@ export class OpenAIChatProvider implements LLMProvider {
         content: response.content,
         err: String(err),
       });
-      return { intent: "unknown", text: input };
+      return { intent: "unknown", data: { reason: "invalid JSON from model" } };
     }
 
-    const safe = IntentSchema.safeParse(parsed);
+    const safe = IntentEnvelopeSchema.safeParse(parsed);
     if (!safe.success) {
       log.warn("classifyIntent: schema validation failed", {
         issues: safe.error.issues,
+        raw: response.content,
       });
-      return { intent: "unknown", text: input };
+      return { intent: "unknown", data: { reason: "schema validation failed" } };
     }
 
-    const result = safe.data;
-    if (!result.text) result.text = input;
-    return result;
+    return safe.data;
+  }
+
+  // ----- File candidate ranking -----
+
+  async rankFileCandidates(input: FileRankInput): Promise<FileRankResult> {
+    if (input.candidates.length === 0) return { bestPath: null };
+    if (input.candidates.length === 1) {
+      return { bestPath: input.candidates[0]!.path };
+    }
+
+    const userPayload = JSON.stringify(
+      {
+        query: input.query,
+        task: input.task ?? null,
+        candidates: input.candidates.map((c) => ({
+          path: c.path,
+          title: c.title,
+        })),
+      },
+      null,
+      2
+    );
+
+    const response = await this.sendMessage({
+      temperature: 0,
+      responseFormat: "json_object",
+      messages: [
+        { role: "system", content: FILE_RANK_SYSTEM_PROMPT },
+        { role: "user", content: userPayload },
+      ],
+    });
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(response.content);
+    } catch (err) {
+      log.warn("rankFileCandidates: invalid JSON, falling back to top score", {
+        content: response.content,
+        err: String(err),
+      });
+      return { bestPath: input.candidates[0]!.path };
+    }
+
+    const safe = FileRankSchema.safeParse(parsed);
+    if (!safe.success) {
+      log.warn("rankFileCandidates: schema validation failed", {
+        issues: safe.error.issues,
+        raw: response.content,
+      });
+      return { bestPath: input.candidates[0]!.path };
+    }
+
+    // Trust nothing the model returns: enforce that bestPath is one of the
+    // candidates we sent, otherwise treat as "no pick" so the caller can
+    // fall back to its own ordering.
+    const allowed = new Set(input.candidates.map((c) => c.path));
+    if (safe.data.bestPath && !allowed.has(safe.data.bestPath)) {
+      log.warn("rankFileCandidates: model returned unknown path", {
+        bestPath: safe.data.bestPath,
+      });
+      return { bestPath: null, reason: safe.data.reason };
+    }
+
+    return {
+      bestPath: safe.data.bestPath,
+      reason: safe.data.reason,
+    };
+  }
+
+  // ----- File task execution -----
+
+  async runFileTask(input: FileTaskInput): Promise<FileTaskOutput> {
+    const instruction = input.instruction?.trim();
+    if (TASK_REQUIRES_INSTRUCTION.has(input.kind) && !instruction) {
+      throw new Error(`File task "${input.kind}" requires an instruction`);
+    }
+
+    const systemPrompt = FILE_TASK_SYSTEM_PROMPTS[input.kind];
+    const userPrompt = buildFileTaskUserPrompt({
+      title: input.title,
+      content: input.content,
+      truncated: !!input.truncated,
+      instruction,
+    });
+
+    const response = await this.sendMessage({
+      // Slightly creative for summaries / answers; deterministic for the
+      // structured `generate_tasks` output so checklist parsing is stable.
+      temperature: input.kind === "generate_tasks" ? 0 : 0.2,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+    });
+
+    const markdown = response.content.trim();
+    const tasks =
+      input.kind === "generate_tasks" ? extractActionItems(markdown) : [];
+    return { markdown, tasks };
   }
 
   // ----- Summarization -----
@@ -146,43 +292,181 @@ export class OpenAIChatProvider implements LLMProvider {
 
 // ---- Internal: prompts and parsers ----
 
-const IntentSchema = z.object({
-  intent: z.enum([
-    "note",
-    "create_task",
-    "complete_task",
-    "search",
-    "ask_vault_question",
-    "unknown",
-  ]),
-  text: z.string().default(""),
-  title: z.string().optional(),
-  taskText: z.string().optional(),
-  tags: z.array(z.string()).optional(),
-});
+/**
+ * Strict per-intent envelope. The LLM must return EXACTLY one of these shapes
+ * — `discriminatedUnion` enforces the right `data` shape per intent and
+ * rejects anything malformed before it reaches the business layer.
+ */
+const IntentEnvelopeSchema = z.discriminatedUnion("intent", [
+  z.object({
+    intent: z.literal("note"),
+    data: z.object({
+      text: z.string().min(1),
+      title: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+    }),
+  }),
+  z.object({
+    intent: z.literal("create_task"),
+    data: z.object({ taskText: z.string().min(1) }),
+  }),
+  z.object({
+    intent: z.literal("complete_task"),
+    data: z.object({ taskText: z.string().min(1) }),
+  }),
+  z.object({
+    intent: z.literal("search"),
+    data: z.object({ query: z.string().min(1) }),
+  }),
+  z.object({
+    intent: z.literal("ask_vault_question"),
+    data: z.object({ question: z.string().min(1) }),
+  }),
+  z.object({
+    intent: z.literal("find_file"),
+    data: z.object({ query: z.string().min(1) }),
+  }),
+  z.object({
+    intent: z.literal("open_file_for_task"),
+    data: z.object({
+      query: z.string().min(1),
+      task: z.string().min(1),
+    }),
+  }),
+  z.object({
+    intent: z.literal("unknown"),
+    data: z.object({ reason: z.string().optional() }).default({}),
+  }),
+]);
 
 const INTENT_SYSTEM_PROMPT = [
   "You are an intent classifier for a personal Obsidian-backed assistant.",
-  "Given a user's short request (typed or transcribed from voice),",
-  "decide which single action best matches and extract the relevant fields.",
+  "Given a user's short request (typed or transcribed from voice), choose",
+  "EXACTLY ONE intent and extract the fields it requires.",
   "",
-  "Possible intents:",
-  '  - "note": user wants to save a thought, idea, or piece of content as a note.',
-  '  - "create_task": user wants to add a TODO / action item.',
-  '  - "complete_task": user wants to mark an existing task as done.',
-  '  - "search": user wants to find existing notes or tasks by keyword.',
-  '  - "ask_vault_question": user is asking a question that should be answered using vault content.',
-  '  - "unknown": none of the above clearly applies.',
+  "Hard rules — the assistant downstream will refuse to break these, so do",
+  "not invent intents that imply them:",
+  "  * It NEVER deletes files.",
+  "  * It NEVER reads the full content of a vault file without explicit",
+  "    user confirmation. Use `find_file` / `open_file_for_task` to surface",
+  "    candidates so the user can confirm before any read.",
   "",
-  "Respond with STRICT JSON only matching this schema:",
-  "{",
-  '  "intent": "note"|"create_task"|"complete_task"|"search"|"ask_vault_question"|"unknown",',
-  '  "text": "<cleaned-up content of the user request, no command chrome>",',
-  '  "title": "<short title hint, only when intent=note>",',
-  '  "taskText": "<task content, only when intent=create_task or complete_task>",',
-  '  "tags": ["optional","tags"]',
-  "}",
+  "Intents and their required `data` payloads:",
+  '  - "note":               { text: string, title?: string, tags?: string[] }',
+  '       User wants to save a thought / idea / content as a note.',
+  '  - "create_task":        { taskText: string }',
+  '       User wants to add a TODO / action item.',
+  '  - "complete_task":      { taskText: string }',
+  '       User wants to mark an existing open task as done. `taskText` is the',
+  '       fuzzy-search needle, not necessarily a verbatim quote.',
+  '  - "search":             { query: string }',
+  '       Keyword search across the vault. Use this when the user wants a',
+  '       list of matching notes (NOT a synthesized answer).',
+  '  - "ask_vault_question": { question: string }',
+  '       The user is asking a question to be answered from vault content.',
+  '  - "find_file":          { query: string }',
+  '       The user wants to locate a file by name/title only. No body is read.',
+  '  - "open_file_for_task": { query: string, task: string }',
+  '       The user wants to open / inspect a specific file in order to perform',
+  '       some follow-up `task` (e.g. "open my reading list and add this book").',
+  '       The handler will surface the matched file and ASK FOR CONFIRMATION',
+  '       before reading it.',
+  '  - "unknown":            { reason?: string }',
+  '       Use when nothing else clearly applies.',
+  "",
+  'Respond with STRICT JSON only, exactly: { "intent": "...", "data": { ... } }',
+  "No prose, no markdown, no extra fields.",
 ].join("\n");
+
+const FileRankSchema = z.object({
+  bestPath: z.string().min(1).nullable(),
+  reason: z.string().optional(),
+});
+
+const FILE_RANK_SYSTEM_PROMPT = [
+  "You rank vault file candidates against a user's lookup query and an",
+  "optional follow-up task. The user has NOT confirmed any read yet — you",
+  "only see file paths and titles, never any file body content.",
+  "",
+  "Pick the SINGLE candidate whose `title` and `path` best match the user's",
+  "intent. Prefer:",
+  "  * exact / phrase matches in the title over scattered token matches",
+  "  * files whose path/folder fits the task (e.g. a 'reading list' under",
+  '    `Lists/` beats a "reading log" under `Journals/` for "add Dune")',
+  "  * the SHORTEST title when multiple files match equally well",
+  "",
+  "If nothing is a clear, sensible fit, set `bestPath` to null instead of",
+  "guessing. NEVER invent a path that isn't in the candidate list.",
+  "",
+  'Respond with STRICT JSON only: { "bestPath": "<path|null>", "reason": "<one short sentence>" }',
+  "No prose, no markdown, no extra fields.",
+].join("\n");
+
+// ---- File task prompts ----
+
+const TASK_REQUIRES_INSTRUCTION: ReadonlySet<FileTaskKind> = new Set([
+  "extract",
+  "answer",
+]);
+
+const FILE_TASK_SYSTEM_PROMPTS: Record<FileTaskKind, string> = {
+  summarize: [
+    "You summarize a single user-confirmed Obsidian note.",
+    "Output exactly two markdown sections, in this order:",
+    "  '## Summary'    — 3 to 6 concise bullet points capturing the gist.",
+    "  '## Key Facts'  — bullet list of concrete facts (names, dates, links).",
+    "                    May be empty; omit the section entirely in that case.",
+    "Use ONLY the note. Do not invent content. No preamble, no other sections.",
+  ].join("\n"),
+  extract: [
+    "You extract structured information from a single user-confirmed",
+    "Obsidian note. The user provides an explicit instruction describing",
+    "what to extract.",
+    "",
+    "Return ONLY the extracted data as markdown — a list, table, or fenced",
+    "code block as appropriate. Do NOT add commentary, caveats, or summaries.",
+    "If the requested data is not present in the note, output exactly:",
+    "  (not found)",
+  ].join("\n"),
+  answer: [
+    "You answer a question about a single user-confirmed Obsidian note.",
+    "Use ONLY the note's content. If the answer isn't in the note, say so",
+    "plainly with: 'The note doesn't say.' Be concise (1–3 short paragraphs",
+    "or a short bullet list). No preamble, no caveats.",
+  ].join("\n"),
+  generate_tasks: [
+    "You identify actionable items in a single user-confirmed Obsidian note.",
+    "Output ONE markdown checklist of '- [ ] <task>' items, in priority order.",
+    "Each task must be:",
+    "  * a concrete, single action (not a category)",
+    "  * derivable directly from the note (no invention)",
+    "  * one line, no sub-bullets, no extra prose",
+    "If the note contains no actionable items, output exactly:",
+    "  (no actionable items)",
+  ].join("\n"),
+};
+
+function buildFileTaskUserPrompt(args: {
+  title: string;
+  content: string;
+  truncated: boolean;
+  instruction?: string;
+}): string {
+  const parts = [
+    `Note title: ${args.title}`,
+    "Note content:",
+    '"""',
+    args.content,
+    '"""',
+  ];
+  if (args.truncated) {
+    parts.push("(Note: the body above was truncated for length.)");
+  }
+  if (args.instruction) {
+    parts.push("", `Instruction: ${args.instruction}`);
+  }
+  return parts.join("\n");
+}
 
 const SUMMARY_SYSTEM_PROMPT =
   "Summarize the following chat conversation. " +

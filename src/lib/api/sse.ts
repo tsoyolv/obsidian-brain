@@ -25,12 +25,20 @@ export function sseResponse(
     async start(controller) {
       const enqueue = (frame: string) =>
         controller.enqueue(encoder.encode(frame));
+      // Preamble: a comment frame flushes headers + opens the TCP pipe on the
+      // client fetch reader immediately, before the first token arrives.
+      // Without it some dev-server/proxy setups wait for ~a few KB of body.
+      enqueue(`: open\n\n`);
       try {
         for await (const ev of produce()) {
           let frame = "";
           if (ev.event) frame += `event: ${ev.event}\n`;
           frame += `data: ${ev.data === undefined ? "{}" : JSON.stringify(ev.data)}\n\n`;
           enqueue(frame);
+          // Yield to the event loop so each enqueue is delivered as its own
+          // TCP write rather than coalesced with subsequent frames in the
+          // same synchronous tick.
+          await Promise.resolve();
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : "stream failed";

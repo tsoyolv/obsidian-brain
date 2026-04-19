@@ -7,9 +7,9 @@ interface Props {
   onChange: (id: TabId) => void;
 }
 
-const TABS: { id: TabId; label: string }[] = [
-  { id: "capture", label: "Capture" },
-  { id: "chat", label: "Chat" },
+const TABS: { id: TabId; label: string; sub: string }[] = [
+  { id: "capture", label: "Capture", sub: "operational" },
+  { id: "chat", label: "Chat", sub: "discussion" },
 ];
 
 export function TabSwitcher({ current, onChange }: Props) {
@@ -27,13 +27,21 @@ export function TabSwitcher({ current, onChange }: Props) {
             aria-selected={active}
             onClick={() => onChange(t.id)}
             className={
-              "rounded-lg px-4 py-1.5 text-sm font-medium transition " +
+              "flex flex-col items-start rounded-lg px-3 py-1 text-left transition leading-tight " +
               (active
                 ? "bg-accent text-white shadow-sm"
                 : "text-ink-muted hover:text-ink hover:bg-bg-panel")
             }
           >
-            {t.label}
+            <span className="text-sm font-medium">{t.label}</span>
+            <span
+              className={
+                "text-[10px] uppercase tracking-wider " +
+                (active ? "text-white/70" : "text-ink-dim")
+              }
+            >
+              {t.sub}
+            </span>
           </button>
         );
       })}
