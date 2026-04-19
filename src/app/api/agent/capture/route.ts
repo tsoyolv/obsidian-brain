@@ -1,11 +1,17 @@
 import { z } from "zod";
-import { confirmTurn, runTurn } from "@/lib/agent/orchestrator";
+import {
+  AGENT_TOKEN_LIMIT,
+  confirmTurn,
+  estimateAgentNextPromptTokens,
+  runTurn,
+} from "@/lib/agent/orchestrator";
 import type { AgentEvent } from "@/lib/agent/orchestrator";
 import { getAgentSessionStore } from "@/lib/agent/session";
 import { sseResponse } from "@/lib/api/sse";
 import { handleError } from "@/lib/api/responses";
 import { getCaptureService } from "@/lib/services/capture";
 import { createLogger } from "@/lib/utils/logger";
+import { estimateTokens } from "@/lib/utils/tokens";
 
 export const runtime = "nodejs";
 
@@ -57,6 +63,7 @@ const CancelBodySchema = z.object({
  *   event: message_delta      data: { type, text }
  *   event: needs_confirmation data: { type, token, toolName, args, preview }
  *   event: final              data: { type, message }
+ *   event: done               data: { usage }     // turn token accounting
  *   event: end                data: {}
  *
  * Vault-safety invariants are unchanged: any confirmation-gated tool
@@ -136,12 +143,19 @@ export async function POST(req: Request) {
 
     return sseResponse(
       async function* () {
+        let assistantBuffer = "";
         for await (const ev of confirmTurn({
           sessionId: body.sessionId,
           token: body.token,
         })) {
+          if (ev.type === "message_delta") assistantBuffer += ev.text;
+          else if (ev.type === "final" && !assistantBuffer.trim()) {
+            assistantBuffer = ev.message;
+          }
           yield { event: ev.type, data: ev };
         }
+        const usage = bumpTurnUsage(body.sessionId, assistantBuffer);
+        yield { event: "done", data: { usage } };
         yield { event: "end", data: {} };
       },
       { scope: "POST /api/agent/capture (confirm)" }
@@ -201,16 +215,59 @@ export async function POST(req: Request) {
   return sseResponse(
     async function* () {
       let lastType: AgentEvent["type"] | undefined;
+      let assistantBuffer = "";
       for await (const ev of runTurn({
         sessionId: body.sessionId,
         userText: body.text,
       })) {
         lastType = ev.type;
+        if (ev.type === "message_delta") assistantBuffer += ev.text;
+        else if (ev.type === "final" && !assistantBuffer.trim()) {
+          assistantBuffer = ev.message;
+        }
         yield { event: ev.type, data: ev };
       }
-      log.info("stream: done", { sessionId: body.sessionId, lastType });
+      const usage = bumpTurnUsage(body.sessionId, assistantBuffer);
+      log.info("stream: done", {
+        sessionId: body.sessionId,
+        lastType,
+        sessionTotalTokens: usage.sessionTotalTokens,
+        lastTurnTotalTokens: usage.lastTurnTotalTokens,
+      });
+      yield { event: "done", data: { usage } };
       yield { event: "end", data: {} };
     },
     { scope: "POST /api/agent/capture" }
   );
+}
+
+/**
+ * Bump the agent session's cumulative token counter for a just-finished
+ * turn and return a chat-shaped {@link SessionTokenUsage} payload so the
+ * Capture UI can render the same context-budget bar as long-form chats.
+ *
+ * Estimate (not exact) — the orchestrator may make multiple LLM calls per
+ * turn (tool loops, final summary), so we approximate by:
+ *   - lastTurnPromptTokens   = next-turn prompt estimate AFTER appending
+ *                              this turn's messages (close to the prompt
+ *                              size the FINAL LLM call in this turn used)
+ *   - lastTurnCompletionTokens = estimated tokens in the assistant buffer
+ *   - sessionTotalTokens      = cumulative bump
+ */
+function bumpTurnUsage(sessionId: string, assistantBuffer: string) {
+  const sessions = getAgentSessionStore();
+  const promptEstimate = estimateAgentNextPromptTokens(sessionId);
+  const completionEstimate = estimateTokens(assistantBuffer);
+  const turnTokens = promptEstimate + completionEstimate;
+  const previous = sessions.get(sessionId)?.totalTokensUsed ?? 0;
+  const sessionTotalTokens = previous + turnTokens;
+  sessions.setTotalTokensUsed(sessionId, sessionTotalTokens);
+  return {
+    lastTurnTotalTokens: turnTokens,
+    lastTurnPromptTokens: promptEstimate,
+    lastTurnCompletionTokens: completionEstimate,
+    sessionTotalTokens,
+    nextPromptEstimateTokens: promptEstimate,
+    limitTokens: AGENT_TOKEN_LIMIT,
+  };
 }

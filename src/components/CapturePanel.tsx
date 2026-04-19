@@ -59,6 +59,29 @@ interface PendingConfirmation {
   candidates?: unknown[];
 }
 
+/**
+ * Per-turn token accounting reported by the agent capture SSE `done`
+ * frame. Mirrors the long-form chat panel's shape exactly so the
+ * context-budget bar is identical across surfaces. All numbers are
+ * estimates — see `bumpTurnUsage` server-side for the heuristic.
+ */
+interface TurnUsage {
+  lastTurnTotalTokens?: number;
+  lastTurnPromptTokens?: number;
+  lastTurnCompletionTokens?: number;
+  lastTurnCachedTokens?: number;
+  sessionTotalTokens: number;
+  nextPromptEstimateTokens: number;
+  limitTokens: number;
+}
+
+const DEFAULT_TOKEN_LIMIT = 100_000;
+
+function formatTokens(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k`;
+  return String(n);
+}
+
 interface HistoryEntry {
   id: string;
   inputText: string;
@@ -80,6 +103,10 @@ export function CapturePanel() {
   const [pendingVoice, setPendingVoice] = useState<PendingVoice | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [globalError, setGlobalError] = useState<string | null>(null);
+  const [tokenLimit, setTokenLimit] = useState<number>(DEFAULT_TOKEN_LIMIT);
+  const [lastTurn, setLastTurn] = useState<TurnUsage | null>(null);
+  const [sessionTokensUsed, setSessionTokensUsed] = useState<number>(0);
+  const [contextNow, setContextNow] = useState<number>(0);
   const endRef = useRef<HTMLDivElement | null>(null);
   const textRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -108,6 +135,13 @@ export function CapturePanel() {
     updater: (entry: HistoryEntry) => HistoryEntry
   ) {
     setHistory((prev) => prev.map((e) => (e.id === id ? updater(e) : e)));
+  }
+
+  function applyTurnUsage(usage: TurnUsage) {
+    setLastTurn(usage);
+    setTokenLimit(usage.limitTokens);
+    setSessionTokensUsed(usage.sessionTotalTokens);
+    setContextNow(usage.nextPromptEstimateTokens);
   }
 
   const lastEntry = history[history.length - 1];
@@ -190,6 +224,16 @@ export function CapturePanel() {
         } catch {
           continue;
         }
+
+        // Terminal `done` frame: carries per-turn token usage so the
+        // capture chat's context-budget bar can refresh after every
+        // turn (mirrors the long-form chat path).
+        if (event === "done") {
+          const p = payload as { usage?: TurnUsage };
+          if (p.usage) applyTurnUsage(p.usage);
+          continue;
+        }
+
         const ev = payload as
           | {
               type: "tool_call";
@@ -481,6 +525,19 @@ export function CapturePanel() {
 
   const busy = textBusy || transcribing;
 
+  const ctxPct =
+    tokenLimit > 0 ? Math.min(100, (contextNow / tokenLimit) * 100) : 0;
+  const ctxBarColor =
+    ctxPct >= 95
+      ? "bg-red-500"
+      : ctxPct >= 75
+        ? "bg-amber-500"
+        : "bg-emerald-500";
+  const lastCached = lastTurn?.lastTurnCachedTokens ?? 0;
+  const lastPrompt = lastTurn?.lastTurnPromptTokens ?? 0;
+  const cacheHitPct =
+    lastPrompt > 0 ? Math.round((lastCached / lastPrompt) * 100) : 0;
+
   return (
     <div className="grid h-[calc(100vh-9rem)] grid-cols-1 gap-4 lg:grid-cols-[1fr,300px]">
       <div className="flex h-full min-h-0 flex-col rounded-xl border border-bg-border bg-bg-panel">
@@ -492,12 +549,64 @@ export function CapturePanel() {
               before reading or deleting any vault file.
             </div>
           </div>
-          {busy ? (
-            <div className="flex items-center gap-2 text-[11px] text-ink-dim">
-              <Spinner />
-              <span>{transcribing ? "Transcribing…" : "Working…"}</span>
+          <div className="flex items-center gap-3">
+            <div
+              className="flex flex-col items-end gap-1"
+              title={
+                [
+                  `Context window (next turn estimate): ${contextNow} tok`,
+                  `Session cumulative (estimated): ${sessionTokensUsed} tok`,
+                  lastTurn?.lastTurnTotalTokens !== undefined
+                    ? `Last turn: ${lastTurn.lastTurnTotalTokens} tok` +
+                      (lastTurn.lastTurnPromptTokens !== undefined
+                        ? ` (prompt ${lastTurn.lastTurnPromptTokens}, completion ${lastTurn.lastTurnCompletionTokens})`
+                        : "")
+                    : null,
+                  lastCached > 0
+                    ? `Cached prompt: ${lastCached} tok (${cacheHitPct}% of prompt)`
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join("\n")
+              }
+            >
+              <div className="flex items-baseline gap-1 font-mono text-[11px] text-ink-dim">
+                <span className="text-ink-dim">ctx</span>
+                <span className="text-ink">{formatTokens(contextNow)}</span>
+                <span>/</span>
+                <span>{formatTokens(tokenLimit)}</span>
+                <span>tok</span>
+                {lastTurn?.lastTurnTotalTokens !== undefined ? (
+                  <span className="ml-1 text-emerald-400">
+                    +{formatTokens(lastTurn.lastTurnTotalTokens)}
+                  </span>
+                ) : null}
+                {lastCached > 0 ? (
+                  <span
+                    className="ml-1 rounded bg-sky-500/15 px-1 text-sky-300"
+                    title={`${cacheHitPct}% of last prompt served from provider cache`}
+                  >
+                    cache {formatTokens(lastCached)}
+                  </span>
+                ) : null}
+              </div>
+              <div className="h-1 w-28 overflow-hidden rounded bg-bg-elevated">
+                <div
+                  className={`h-full ${ctxBarColor} transition-all`}
+                  style={{ width: `${ctxPct}%` }}
+                />
+              </div>
+              <div className="font-mono text-[10px] text-ink-dim">
+                total {formatTokens(sessionTokensUsed)}
+              </div>
             </div>
-          ) : null}
+            {busy ? (
+              <div className="flex items-center gap-2 text-[11px] text-ink-dim">
+                <Spinner />
+                <span>{transcribing ? "Transcribing…" : "Working…"}</span>
+              </div>
+            ) : null}
+          </div>
         </div>
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">

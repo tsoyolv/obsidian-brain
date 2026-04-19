@@ -6,6 +6,7 @@ import type {
 } from "@/lib/providers/llm";
 import { createLogger } from "@/lib/utils/logger";
 import { newId } from "@/lib/utils/id";
+import { estimateTokensForMessages } from "@/lib/utils/tokens";
 import {
   getAgentSessionStore,
   PENDING_CONFIRMATION_TTL_MS,
@@ -38,6 +39,15 @@ const MAX_TOOL_CALLS_PER_TURN = 4;
  * surfaces a final apology message.
  */
 const MAX_INVALID_ARGS_RETRIES = 1;
+
+/**
+ * Hard cap on the prompt-input tokens we report against, used by the
+ * capture chat's context-budget bar. Mirrors the long-form chat limit so
+ * both surfaces share one mental model. Pure UI / accounting concept —
+ * the orchestrator itself doesn't enforce a token ceiling at this layer
+ * (the rolling history cap is the structural bound).
+ */
+export const AGENT_TOKEN_LIMIT = 100_000;
 
 const SYSTEM_PROMPT = [
   "You are an agent for the user's personal Obsidian-backed brain.",
@@ -300,6 +310,35 @@ export async function* confirmTurn(
     sessionId: session.id,
     tool: tool.name,
   });
+}
+
+// ---- token accounting ----
+
+/**
+ * Estimate the prompt size (in tokens) that the NEXT turn against this
+ * session would send to the LLM. Uses the same {@link buildPromptMessages}
+ * pipeline the iterative loop uses, so the number tracks the actual
+ * payload to within the estimator's ~15% accuracy band.
+ *
+ * Cheap pure function — safe to call from request handlers / SSE finalizers
+ * to drive the capture chat's context-budget bar.
+ *
+ * Returns 0 for unknown session ids so callers don't have to defensively
+ * branch.
+ */
+export function estimateAgentNextPromptTokens(
+  sessionId: string,
+  systemSuffix?: string
+): number {
+  const sessions = getAgentSessionStore();
+  const session = sessions.get(sessionId);
+  if (!session) return 0;
+  const messages = buildPromptMessages(
+    session.messages,
+    session.pendingConfirmation,
+    systemSuffix
+  );
+  return estimateTokensForMessages(messages);
 }
 
 // ---- iterative loop ----

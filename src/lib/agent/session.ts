@@ -46,6 +46,13 @@ export interface AgentSession {
    * pre-loop sees it has already survived one user turn unconsumed.
    */
   pendingConfirmation?: PendingConfirmation;
+  /**
+   * Cumulative token estimate across every turn in this agent session.
+   * Maintained by the route layer (capture / chat agent path) and surfaced
+   * in the UI as the session "total" counter so capture chats render the
+   * same context-budget bar as long-form chats.
+   */
+  totalTokensUsed?: number;
 }
 
 /**
@@ -90,6 +97,12 @@ export interface AgentSessionStore {
    * consume the pending; the NEXT turn entry will then discard it.
    */
   markPendingStale(id: string): AgentSession;
+  /**
+   * Set the cumulative token counter for this session. Idempotent — the
+   * route layer is the authoritative source so we just store whatever it
+   * computed.
+   */
+  setTotalTokensUsed(id: string, total: number): AgentSession;
   /** Snapshot of all sessions, newest-first. Intended for diagnostics. */
   all(): AgentSession[];
 }
@@ -183,6 +196,13 @@ class InMemoryAgentSessionStore implements AgentSessionStore {
     return session;
   }
 
+  setTotalTokensUsed(id: string, total: number): AgentSession {
+    const session = this.ensure(id);
+    session.totalTokensUsed = total;
+    session.updatedAt = new Date().toISOString();
+    return session;
+  }
+
   all(): AgentSession[] {
     return [...this.sessions.values()].sort((a, b) =>
       b.updatedAt.localeCompare(a.updatedAt)
@@ -193,7 +213,12 @@ class InMemoryAgentSessionStore implements AgentSessionStore {
 // Cached on globalThis so the store survives Next.js HMR reloads in dev —
 // same trick used by `chat/sessionStore.ts`. Without this, every code edit
 // would drop in-flight agent conversations and confirmations.
-const GLOBAL_KEY = "__obsidianBrainAgentSessionStore";
+//
+// The trailing `vN` is a schema version: bump it whenever the store's
+// method surface or session shape changes incompatibly, so a stale cached
+// instance from a previous dev session can't survive HMR and call into a
+// stub that no longer exists.
+const GLOBAL_KEY = "__obsidianBrainAgentSessionStore_v2";
 type GlobalWithStore = typeof globalThis & {
   [GLOBAL_KEY]?: AgentSessionStore;
 };
