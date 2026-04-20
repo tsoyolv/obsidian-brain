@@ -37,6 +37,17 @@ export interface CreateTaskInput {
    */
   targetFile?: string;
   text: string;
+  /**
+   * Optional priority marker for new task lines.
+   * high   -> ⏫
+   * medium -> 🔼
+   * low    -> 🔽
+   */
+  priority?: "high" | "medium" | "low";
+  /** Optional hashtags appended to the task body (e.g. ["cto", "#infra"]). */
+  tags?: string[];
+  /** Optional due date in ISO format (YYYY-MM-DD), rendered as 📅 YYYY-MM-DD. */
+  dueDate?: string;
 }
 
 export interface CreateTaskResult {
@@ -87,11 +98,12 @@ class TaskServiceImpl implements TaskService {
   private readonly archiveDoneThreshold = getConfig().tasks.archiveDoneThreshold;
 
   async createTask(input: CreateTaskInput): Promise<CreateTaskResult> {
-    const text = input.text.trim();
-    if (!text) {
+    const rawText = input.text.trim();
+    if (!rawText) {
       log.warn("createTask: empty text");
       throw new Error("Task text must not be empty");
     }
+    const text = buildTaskBody(rawText, input.priority, input.tags, input.dueDate);
 
     const targetRel = input.targetFile
       ? this.vault.safePathResolve(normalizeMarkdownRelPath(input.targetFile))
@@ -221,7 +233,8 @@ class TaskServiceImpl implements TaskService {
   }
 
   private async markTaskDone(hit: TaskHit): Promise<void> {
-    const updated = hit.raw.replace(/\[( |x|X)\]/, "[x]");
+    let updated = hit.raw.replace(/\[( |x|X)\]/, "[x]");
+    updated = ensureCompletedStamp(updated);
     if (updated === hit.raw) return;
     await this.vault.replaceLine(hit.path, hit.line, updated);
   }
@@ -378,4 +391,111 @@ function normalizeMarkdownRelPath(input: string): string {
   const leaf = parts.pop()!;
   const normalizedLeaf = ensureMarkdownExt(leaf);
   return [...parts, normalizedLeaf].join("/");
+}
+
+function ensureCreatedStamp(text: string): string {
+  if (/\s➕\s\d{4}-\d{2}-\d{2}\s*$/.test(text)) {
+    return text;
+  }
+  return `${text} ➕ ${todayIsoDate()}`;
+}
+
+function ensureCompletedStamp(taskLine: string): string {
+  if (/\s✅\s\d{4}-\d{2}-\d{2}\s*$/.test(taskLine)) {
+    return taskLine;
+  }
+  return `${taskLine} ✅ ${todayIsoDate()}`;
+}
+
+function todayIsoDate(): string {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function buildTaskBody(
+  rawText: string,
+  priority?: "high" | "medium" | "low",
+  tags?: string[],
+  dueDate?: string
+): string {
+  const strippedPriority = stripPriorityMarker(rawText).trim();
+  const strippedDueDate = stripDueDateMarker(strippedPriority).trim();
+  const withTags = appendMissingTags(strippedDueDate, tags);
+  const withPriority = appendPriorityMarker(withTags, priority ?? "medium");
+  const withDueDate = appendDueDateMarker(withPriority, dueDate);
+  return ensureCreatedStamp(withDueDate);
+}
+
+function stripPriorityMarker(text: string): string {
+  return text.replace(/\s(?:⏫|🔼|🔽)\s*$/, "").trim();
+}
+
+function appendPriorityMarker(
+  text: string,
+  priority: "high" | "medium" | "low"
+): string {
+  const marker = priorityToMarker(priority);
+  if (new RegExp(`\\s${marker}\\s*$`).test(text)) return text;
+  return `${text} ${marker}`.trim();
+}
+
+function priorityToMarker(priority: "high" | "medium" | "low"): string {
+  if (priority === "high") return "⏫";
+  if (priority === "low") return "🔽";
+  return "🔼";
+}
+
+function appendMissingTags(text: string, tags?: string[]): string {
+  if (!tags || tags.length === 0) return text;
+  const normalized = normalizeTags(tags);
+  if (normalized.length === 0) return text;
+  const existing = new Set((text.match(/#[^\s#]+/g) ?? []).map((t) => t.toLowerCase()));
+  const missing = normalized.filter((t) => !existing.has(t.toLowerCase()));
+  if (missing.length === 0) return text;
+  return `${text} ${missing.join(" ")}`.trim();
+}
+
+function stripDueDateMarker(text: string): string {
+  return text.replace(/\s📅\s\d{4}-\d{2}-\d{2}\s*$/, "").trim();
+}
+
+function appendDueDateMarker(text: string, dueDate?: string): string {
+  if (!dueDate) return text;
+  const parsed = normalizeIsoDate(dueDate);
+  if (!parsed) return text;
+  if (new RegExp(`\\s📅\\s${parsed}\\s*$`).test(text)) return text;
+  return `${text} 📅 ${parsed}`.trim();
+}
+
+function normalizeTags(tags: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const tag of tags) {
+    const trimmed = tag.trim();
+    if (!trimmed) continue;
+    const clean = trimmed.replace(/^#+/, "").replace(/[^\p{L}\p{N}_-]+/gu, "");
+    if (!clean) continue;
+    const normalized = `#${clean}`;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function normalizeIsoDate(input: string): string | null {
+  const candidate = input.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(candidate)) return null;
+  const d = new Date(`${candidate}T00:00:00.000Z`);
+  if (Number.isNaN(d.getTime())) return null;
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const normalized = `${yyyy}-${mm}-${dd}`;
+  if (normalized !== candidate) return null;
+  return normalized;
 }

@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { SkeletonLines, Spinner } from "./Spinner";
 
 export interface SessionSummary {
@@ -73,6 +74,16 @@ export function ChatSessionList({
   creating,
   loading,
 }: Props) {
+  const DELETED_PAGE_SIZE = 10;
+  const [visibleDeletedCount, setVisibleDeletedCount] = useState(DELETED_PAGE_SIZE);
+
+  useEffect(() => {
+    setVisibleDeletedCount(DELETED_PAGE_SIZE);
+  }, [deletedSessions]);
+
+  const visibleDeletedSessions = (deletedSessions ?? []).slice(0, visibleDeletedCount);
+  const hasMoreDeleted = (deletedSessions?.length ?? 0) > visibleDeletedCount;
+
   return (
     <div className="flex h-full flex-col gap-2">
       <button
@@ -189,10 +200,10 @@ export function ChatSessionList({
       {deletedSessions && deletedSessions.length > 0 ? (
         <div className="rounded-xl border border-bg-border bg-bg-panel">
           <div className="border-b border-bg-border px-3 py-2 text-[11px] uppercase tracking-wider text-ink-dim">
-            Deleted chats
+            Deleted chats (latest first)
           </div>
-          <ul className="divide-y divide-bg-border">
-            {deletedSessions.slice(0, 8).map((s) => {
+          <ul className="max-h-72 overflow-y-auto divide-y divide-bg-border">
+            {visibleDeletedSessions.map((s) => {
               const restoring = restoringPath === s.deletedPath;
               return (
                 <li key={s.deletedPath} className="flex items-start gap-2 px-2 py-1.5">
@@ -215,6 +226,19 @@ export function ChatSessionList({
               );
             })}
           </ul>
+          {hasMoreDeleted ? (
+            <div className="border-t border-bg-border px-2 py-2">
+              <button
+                type="button"
+                onClick={() =>
+                  setVisibleDeletedCount((prev) => prev + DELETED_PAGE_SIZE)
+                }
+                className="w-full rounded border border-bg-border bg-bg px-2 py-1.5 text-xs text-ink-dim hover:bg-bg-elevated"
+              >
+                Show more deleted chats
+              </button>
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>

@@ -7,6 +7,22 @@ const ParamsSchema = z.object({
     .string()
     .min(1)
     .describe("Concrete TODO text. No checkbox / bullet prefix."),
+  priority: z
+    .enum(["high", "medium", "low"])
+    .optional()
+    .describe(
+      "Optional task priority: high=⏫, medium=🔼, low=🔽. Defaults to medium."
+    ),
+  tags: z
+    .array(z.string().min(1))
+    .max(20)
+    .optional()
+    .describe("Optional list of hashtags, with or without leading #."),
+  dueDate: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .optional()
+    .describe("Optional due date in ISO format YYYY-MM-DD, rendered as 📅 YYYY-MM-DD."),
   targetFile: z
     .string()
     .optional()
@@ -34,6 +50,9 @@ export const createTaskTool: AgentTool<z.infer<typeof ParamsSchema>, CreateTaskO
     const tasks = getTaskService();
     const result = await tasks.createTask({
       text: input.taskText,
+      priority: input.priority,
+      tags: input.tags,
+      dueDate: input.dueDate,
       targetFile: input.targetFile,
     });
     ctx.logger.info("create_task: created", {
