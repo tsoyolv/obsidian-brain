@@ -857,7 +857,7 @@ export function ChatPanel() {
   const webSearchEnabled = current?.webSearchEnabled !== false;
 
   return (
-    <div className="grid h-[calc(100vh-9rem)] grid-cols-1 gap-4 md:grid-cols-[260px,1fr]">
+    <div className="grid h-full min-h-0 grid-cols-1 gap-4 md:grid-cols-[260px,1fr]">
       <ChatSessionList
         sessions={sortedSessions}
         currentId={current?.id ?? null}

@@ -75,12 +75,12 @@ export function AppShell() {
         </div>
       </header>
 
-      <main className="mx-auto w-full max-w-6xl flex-1 px-6 py-6">
+      <main className="mx-auto w-full max-w-6xl flex-1 min-h-0 px-6 py-6">
         <ChatPanel />
       </main>
 
       <footer className="border-t border-bg-border bg-bg-elevated/40">
-        <div className="mx-auto max-w-6xl px-6 py-2 text-[11px] text-ink-dim">
+        <div className="pointer-events-none mx-auto max-w-6xl px-6 py-2 text-[11px] text-ink-dim">
           Notes are written directly to your Obsidian vault. The LLM never
           touches the filesystem.
         </div>
