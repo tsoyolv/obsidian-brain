@@ -102,6 +102,8 @@ export function ChatPanel() {
   // Without this, switching to a different chat would race with the
   // effect and snap us back to the freshest session on every refresh.
   const autoOpenedRef = useRef(false);
+  // Guard against accidental double-finalization of the same agent turn.
+  const lastAgentFinalizeKeyRef = useRef<string | null>(null);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -622,8 +624,21 @@ export function ChatPanel() {
           createdAt: now,
         });
       }
+      const finalizeKey = buildAgentFinalizeKey(
+        prev.userMessageId,
+        prev.state.steps,
+        finalText
+      );
+      if (lastAgentFinalizeKeyRef.current === finalizeKey) {
+        return null;
+      }
+      lastAgentFinalizeKeyRef.current = finalizeKey;
       setCurrent((s) =>
-        s ? { ...s, messages: [...s.messages, ...newMsgs] } : s
+        s
+          ? isSameMessageBatchAtTail(s.messages, newMsgs)
+            ? s
+            : { ...s, messages: [...s.messages, ...newMsgs] }
+          : s
       );
       return null;
     });
@@ -1422,4 +1437,53 @@ function extFromMime(mimeType: string): string {
   if (mimeType.includes("mp4")) return "m4a";
   if (mimeType.includes("wav")) return "wav";
   return "webm";
+}
+
+function buildAgentFinalizeKey(
+  userMessageId: string,
+  steps: AgentStep[],
+  finalText: string
+): string {
+  return JSON.stringify({
+    userMessageId,
+    steps: steps.map((s) =>
+      s.kind === "tool_call"
+        ? {
+            kind: s.kind,
+            callId: s.callId,
+            name: s.name,
+            args: stableJson(s.args),
+            result: stableJson(s.result),
+          }
+        : {
+            kind: s.kind,
+            text: s.text,
+          }
+    ),
+    finalText,
+  });
+}
+
+function isSameMessageBatchAtTail(existing: ChatMessage[], batch: ChatMessage[]): boolean {
+  if (batch.length === 0) return true;
+  if (existing.length < batch.length) return false;
+  const start = existing.length - batch.length;
+  for (let i = 0; i < batch.length; i++) {
+    const a = existing[start + i]!;
+    const b = batch[i]!;
+    if (a.role !== b.role) return false;
+    if ((a.toolName ?? "") !== (b.toolName ?? "")) return false;
+    if (a.content !== b.content) return false;
+    if (stableJson(a.args) !== stableJson(b.args)) return false;
+    if (stableJson(a.result) !== stableJson(b.result)) return false;
+  }
+  return true;
+}
+
+function stableJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }

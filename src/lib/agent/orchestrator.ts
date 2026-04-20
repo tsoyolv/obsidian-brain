@@ -23,6 +23,7 @@ import type {
   ToolResult,
 } from "./types";
 import { zodToJsonSchema } from "./zodToJsonSchema";
+import { detectIntent } from "./intentRouter";
 
 const log = createLogger("agentOrchestrator");
 
@@ -34,6 +35,8 @@ const log = createLogger("agentOrchestrator");
  */
 const MAX_TOOL_CALLS_PER_TURN = 4;
 const TOOL_RESULT_TEXT_MAX_CHARS = 1500;
+const MAX_COMPLETE_TASK_AMBIGUITY_RETRIES = 3;
+const TASK_INTENT_CONFIDENCE_THRESHOLD = 0.75;
 
 /**
  * On invalid LLM-supplied tool arguments we feed the validation error back
@@ -72,6 +75,10 @@ const SYSTEM_PROMPT = [
   "",
   "When the user asks about current events, external services, or public web",
   "content, use `web_search` first. Cite source URLs in your final answer.",
+  "",
+  "When a tool returns an ambiguous list (for example `complete_task`), and the",
+  "user explicitly asked you to pick ANY option autonomously, pick one candidate",
+  "and retry instead of asking a follow-up question immediately.",
 ].join("\n");
 
 // ---- Public event shape ----
@@ -229,6 +236,13 @@ export async function* runTurn(
 
   sessions.appendMessage(session.id, { role: "user", content: userText });
 
+  const scriptedHandled = yield* maybeHandleStructuredTaskIntent(
+    session.id,
+    userText,
+    allowedTools
+  );
+  if (scriptedHandled) return;
+
   const t = log.time("runTurn");
   log.debug("runTurn: start", {
     sessionId: session.id,
@@ -248,6 +262,183 @@ export async function* runTurn(
     sessionId: session.id,
     historyLen: sessions.get(session.id)?.messages.length ?? 0,
   });
+}
+
+async function* maybeHandleStructuredTaskIntent(
+  sessionId: string,
+  userText: string,
+  allowedTools?: string[]
+): AsyncGenerator<AgentEvent, boolean, void> {
+  const intent = detectIntent(userText);
+  log.debug("structured-intent: detected", {
+    sessionId,
+    intent: intent.intent,
+    confidence: intent.confidence,
+    autonomousAllowed: intent.autonomousAllowed,
+    hasExtractedTaskText: Boolean(intent.extractedTaskText?.trim()),
+  });
+  if (intent.confidence < TASK_INTENT_CONFIDENCE_THRESHOLD) {
+    return false;
+  }
+
+  const sessions = getAgentSessionStore();
+  const finalMessage = yield* runStructuredIntent(
+    sessionId,
+    intent,
+    userText,
+    allowedTools
+  );
+  if (!finalMessage) return false;
+
+  sessions.appendMessage(sessionId, {
+    role: "assistant",
+    content: finalMessage,
+  });
+  yield { type: "final", message: finalMessage };
+  return true;
+}
+
+async function* runStructuredIntent(
+  sessionId: string,
+  intent: ReturnType<typeof detectIntent>,
+  userText: string,
+  allowedTools?: string[]
+): AsyncGenerator<AgentEvent, string | undefined, void> {
+  log.info("structured-intent: handling", {
+    sessionId,
+    intent: intent.intent,
+    confidence: intent.confidence,
+  });
+  if (intent.intent === "task_complete") {
+    return yield* runStructuredTaskComplete(
+      sessionId,
+      intent,
+      userText,
+      allowedTools
+    );
+  }
+  if (intent.intent === "task_create") {
+    return yield* runStructuredTaskCreate(sessionId, intent, userText, allowedTools);
+  }
+  if (intent.intent === "task_list_open") {
+    return yield* runStructuredTaskListOpen(sessionId, allowedTools);
+  }
+  if (intent.intent === "task_find") {
+    return yield* runStructuredTaskFind(sessionId, intent, userText, allowedTools);
+  }
+  return undefined;
+}
+
+async function* runStructuredTaskComplete(
+  sessionId: string,
+  intent: ReturnType<typeof detectIntent>,
+  userText: string,
+  allowedTools?: string[]
+): AsyncGenerator<AgentEvent, string | undefined, void> {
+  const tool = getAllowedTool("complete_task", allowedTools);
+  if (!tool) return undefined;
+  const triedTaskTexts = new Set<string>();
+  let toolCallsUsed = 0;
+  const firstNeedle =
+    intent.extractedTaskText && intent.extractedTaskText.trim().length > 0
+      ? intent.extractedTaskText
+      : userText;
+  triedTaskTexts.add(normalizeTaskText(firstNeedle));
+  let result = yield* runToolAndYield(sessionId, tool, { taskText: firstNeedle });
+  toolCallsUsed += 1;
+
+  while (
+    result.ok &&
+    isAmbiguousCompleteTaskResult(result.data) &&
+    intent.autonomousAllowed &&
+    toolCallsUsed < MAX_TOOL_CALLS_PER_TURN &&
+    triedTaskTexts.size <= MAX_COMPLETE_TASK_AMBIGUITY_RETRIES + 1
+  ) {
+    const nextTaskText = pickNextAmbiguousTaskText(result, triedTaskTexts);
+    if (!nextTaskText) break;
+    triedTaskTexts.add(normalizeTaskText(nextTaskText));
+    result = yield* runToolAndYield(sessionId, tool, { taskText: nextTaskText });
+    toolCallsUsed += 1;
+  }
+  return buildStructuredTaskCompletionMessage(result, intent.autonomousAllowed);
+}
+
+async function* runStructuredTaskCreate(
+  sessionId: string,
+  intent: ReturnType<typeof detectIntent>,
+  userText: string,
+  allowedTools?: string[]
+): AsyncGenerator<AgentEvent, string | undefined, void> {
+  const tool = getAllowedTool("create_task", allowedTools);
+  if (!tool) return undefined;
+  const taskText =
+    intent.extractedTaskText && intent.extractedTaskText.trim().length > 0
+      ? intent.extractedTaskText
+      : userText;
+  const result = yield* runToolAndYield(sessionId, tool, { taskText });
+  if (!result.ok || !result.data || typeof result.data !== "object") return undefined;
+  const data = result.data as Record<string, unknown>;
+  const text = typeof data.text === "string" ? data.text : taskText;
+  const path = typeof data.path === "string" ? data.path : "Tasks/tasks.md";
+  return `Добавил задачу: "${text}". Файл: ${path}.`;
+}
+
+async function* runStructuredTaskListOpen(
+  sessionId: string,
+  allowedTools?: string[]
+): AsyncGenerator<AgentEvent, string | undefined, void> {
+  const tool = getAllowedTool("list_open_tasks", allowedTools);
+  if (!tool) return undefined;
+  const result = yield* runToolAndYield(sessionId, tool, { limit: 15 });
+  if (!result.ok || !result.data || typeof result.data !== "object") return undefined;
+  const data = result.data as Record<string, unknown>;
+  const totalOpen =
+    typeof data.totalOpen === "number" ? data.totalOpen : undefined;
+  const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+  if (tasks.length === 0) {
+    return "Открытых задач сейчас нет.";
+  }
+  const lines = tasks.slice(0, 10).flatMap((t, idx) => {
+    if (!t || typeof t !== "object") return [];
+    const text = (t as Record<string, unknown>).text;
+    if (typeof text !== "string") return [];
+    return [`${idx + 1}. ${text}`];
+  });
+  const suffix =
+    typeof totalOpen === "number" && totalOpen > lines.length
+      ? `\nИ еще ${totalOpen - lines.length} задач.`
+      : "";
+  return `Нашел открытые задачи:\n${lines.join("\n")}${suffix}`;
+}
+
+async function* runStructuredTaskFind(
+  sessionId: string,
+  intent: ReturnType<typeof detectIntent>,
+  userText: string,
+  allowedTools?: string[]
+): AsyncGenerator<AgentEvent, string | undefined, void> {
+  const tool = getAllowedTool("find_tasks", allowedTools);
+  if (!tool) return undefined;
+  const query =
+    intent.extractedTaskText && intent.extractedTaskText.trim().length > 0
+      ? intent.extractedTaskText
+      : userText;
+  const result = yield* runToolAndYield(sessionId, tool, { query, limit: 10 });
+  if (!result.ok || !result.data || typeof result.data !== "object") return undefined;
+  const data = result.data as Record<string, unknown>;
+  const matches = Array.isArray(data.matches) ? data.matches : [];
+  if (matches.length === 0) {
+    return `По запросу "${query}" задач не нашел.`;
+  }
+  const lines = matches.slice(0, 5).flatMap((m, idx) => {
+    if (!m || typeof m !== "object") return [];
+    const obj = m as Record<string, unknown>;
+    const text = typeof obj.text === "string" ? obj.text : undefined;
+    const done = obj.done === true ? " [выполнено]" : "";
+    if (!text) return [];
+    return [`${idx + 1}. ${text}${done}`];
+  });
+  return `Вот что нашел по запросу "${query}":\n${lines.join("\n")}`;
 }
 
 // ---- confirmTurn ----
@@ -574,7 +765,30 @@ async function* iterativeLoop(
       return;
     }
 
-    yield* runToolAndYield(sessionId, tool, validatedArgs);
+    const firstResult = yield* runToolAndYield(sessionId, tool, validatedArgs);
+    if (
+      tool.name === "complete_task" &&
+      shouldAutopickAnyTask(sessions.get(sessionId)?.messages ?? [])
+    ) {
+      let retries = 0;
+      const triedTaskTexts = new Set<string>();
+      const initialTaskText = getCompleteTaskText(validatedArgs);
+      if (initialTaskText) {
+        triedTaskTexts.add(normalizeTaskText(initialTaskText));
+      }
+      let latestResult = firstResult;
+      while (
+        retries < MAX_COMPLETE_TASK_AMBIGUITY_RETRIES &&
+        toolCallsUsed < MAX_TOOL_CALLS_PER_TURN
+      ) {
+        const nextTaskText = pickNextAmbiguousTaskText(latestResult, triedTaskTexts);
+        if (!nextTaskText) break;
+        triedTaskTexts.add(normalizeTaskText(nextTaskText));
+        toolCallsUsed += 1;
+        retries += 1;
+        latestResult = yield* runToolAndYield(sessionId, tool, { taskText: nextTaskText });
+      }
+    }
     // Loop again so the model can react to the tool result.
   }
 }
@@ -869,7 +1083,7 @@ async function* runToolAndYield(
   sessionId: string,
   tool: AnyAgentTool,
   args: unknown
-): AsyncGenerator<AgentEvent, void, void> {
+): AsyncGenerator<AgentEvent, ToolResult<unknown>, void> {
   const sessions = getAgentSessionStore();
   const callId = newId("call");
   sessions.appendMessage(sessionId, {
@@ -908,6 +1122,7 @@ async function* runToolAndYield(
   // Stream the same compacted payload so chat transcripts and UI tool cards
   // don't store/render full raw file bodies.
   yield { type: "tool_result", callId, name: tool.name, result: historyResult };
+  return historyResult;
 }
 
 /**
@@ -1163,4 +1378,90 @@ function truncateTextField(value: unknown, maxChars: number): unknown {
   if (typeof value !== "string") return value;
   if (value.length <= maxChars) return value;
   return value.slice(0, maxChars) + "\n\n[truncated for token safety]";
+}
+
+function shouldAutopickAnyTask(messages: AgentMessage[]): boolean {
+  const latestUser = getLatestUserMessage(messages);
+  if (!latestUser) return false;
+  const text = latestUser.toLowerCase();
+  const markers = [
+    "любую",
+    "любой",
+    "без меня",
+    "не спрашивая",
+    "самостоятельно",
+    "choose any",
+    "pick any",
+    "without asking",
+    "autonomously",
+  ];
+  return markers.some((marker) => text.includes(marker));
+}
+
+function getLatestUserMessage(messages: AgentMessage[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg?.role === "user") return msg.content;
+  }
+  return undefined;
+}
+
+function getCompleteTaskText(args: unknown): string | undefined {
+  if (!args || typeof args !== "object") return undefined;
+  const value = (args as Record<string, unknown>).taskText;
+  return typeof value === "string" ? value : undefined;
+}
+
+function normalizeTaskText(text: string): string {
+  return text.trim().toLowerCase();
+}
+
+function pickNextAmbiguousTaskText(
+  result: ToolResult<unknown>,
+  triedTaskTexts: Set<string>
+): string | undefined {
+  if (!result.ok || !result.data || typeof result.data !== "object") return undefined;
+  const data = result.data as Record<string, unknown>;
+  if (data.status !== "ambiguous") return undefined;
+  const rawMatches = data.matches;
+  if (!Array.isArray(rawMatches)) return undefined;
+  for (const match of rawMatches) {
+    if (!match || typeof match !== "object") continue;
+    const text = (match as Record<string, unknown>).text;
+    if (typeof text !== "string") continue;
+    if (triedTaskTexts.has(normalizeTaskText(text))) continue;
+    return text;
+  }
+  return undefined;
+}
+
+function isAmbiguousCompleteTaskResult(data: unknown): boolean {
+  if (!data || typeof data !== "object") return false;
+  return (data as Record<string, unknown>).status === "ambiguous";
+}
+
+function buildStructuredTaskCompletionMessage(
+  result: ToolResult<unknown>,
+  autonomousAllowed: boolean
+): string | undefined {
+  if (!result.ok || !result.data || typeof result.data !== "object") {
+    return undefined;
+  }
+  const data = result.data as Record<string, unknown>;
+  const status = data.status;
+  if (status === "ok") {
+    const text = typeof data.text === "string" ? data.text : "задача";
+    const path = typeof data.path === "string" ? data.path : "неизвестный файл";
+    return `Закрыл задачу: "${text}". Файл: ${path}.`;
+  }
+  if (status === "not_found") {
+    return "Не нашел подходящую открытую задачу для закрытия.";
+  }
+  if (status === "ambiguous") {
+    if (autonomousAllowed) {
+      return "Нашел несколько похожих задач, но в пределах лимита попыток не смог надежно закрыть одну.";
+    }
+    return "Нашел несколько похожих задач для закрытия. Уточни, какую именно закрыть.";
+  }
+  return undefined;
 }

@@ -25,8 +25,9 @@ export const completeTaskTool: AgentTool<z.infer<typeof ParamsSchema>, CompleteT
   name: "complete_task",
   description:
     "Mark an existing open task as completed by fuzzy-matching its text. " +
-    "Returns 'ambiguous' when multiple tasks match — the agent should ask " +
-    "the user to be more specific instead of guessing.",
+    "Returns 'ambiguous' when multiple tasks match. If the user explicitly " +
+    "allows autonomous choice ('pick any'), the agent should pick one " +
+    "candidate and retry with exact task text; otherwise ask for disambiguation.",
   parameters: ParamsSchema,
   async run(input, ctx) {
     const tasks = getTaskService();

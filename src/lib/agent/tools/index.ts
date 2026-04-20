@@ -2,6 +2,8 @@ import type { AnyAgentTool } from "../types";
 import { saveNoteTool } from "./save_note";
 import { createTaskTool } from "./create_task";
 import { completeTaskTool } from "./complete_task";
+import { findTasksTool } from "./find_tasks";
+import { listOpenTasksTool } from "./list_open_tasks";
 import { searchVaultTool } from "./search_vault";
 import { findFileTool } from "./find_file";
 import { proposeOpenFileTool } from "./propose_open_file";
@@ -24,6 +26,8 @@ const allTools: AnyAgentTool[] = [
   saveNoteTool,
   createTaskTool,
   completeTaskTool,
+  findTasksTool,
+  listOpenTasksTool,
   searchVaultTool,
   findFileTool,
   proposeOpenFileTool,
@@ -50,6 +54,8 @@ export {
   saveNoteTool,
   createTaskTool,
   completeTaskTool,
+  findTasksTool,
+  listOpenTasksTool,
   searchVaultTool,
   findFileTool,
   proposeOpenFileTool,
