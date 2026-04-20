@@ -34,6 +34,8 @@ interface SessionFull {
   webSearchEnabled?: boolean;
   totalTokensUsed?: number;
   nextPromptEstimateTokens?: number;
+  model?: string;
+  tier?: "fast" | "standard" | "reasoning";
   chatSummary?: ChatSummary;
 }
 
@@ -47,7 +49,7 @@ interface TurnUsage {
   limitTokens: number;
 }
 
-const DEFAULT_TOKEN_LIMIT = 100_000;
+const DEFAULT_TOKEN_LIMIT = 180_000;
 
 function formatTokens(n: number): string {
   if (n >= 1000) return `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k`;
@@ -130,6 +132,8 @@ export function ChatPanel() {
       fresh.updatedAt === current.updatedAt &&
       fresh.totalTokensUsed === current.totalTokensUsed &&
       fresh.nextPromptEstimateTokens === current.nextPromptEstimateTokens &&
+      fresh.model === current.model &&
+      fresh.tier === current.tier &&
       Boolean(fresh.agentEnabled) === Boolean(current.agentEnabled) &&
       Boolean(fresh.webSearchEnabled) === Boolean(current.webSearchEnabled)
     ) {
@@ -145,6 +149,8 @@ export function ChatPanel() {
             webSearchEnabled: fresh.webSearchEnabled,
             totalTokensUsed: fresh.totalTokensUsed,
             nextPromptEstimateTokens: fresh.nextPromptEstimateTokens,
+            model: fresh.model,
+            tier: fresh.tier,
           }
         : prev
     );
@@ -223,6 +229,8 @@ export function ChatPanel() {
       webSearchEnabled: found.webSearchEnabled,
       totalTokensUsed: found.totalTokensUsed,
       nextPromptEstimateTokens: found.nextPromptEstimateTokens,
+      model: found.model,
+      tier: found.tier,
     });
     setLastTurn(null);
     setActiveAgent(null);
@@ -876,6 +884,19 @@ export function ChatPanel() {
               <div className="truncate text-sm font-semibold">
                 {current?.title ?? "Discussion"}
               </div>
+              {current?.model ? (
+                <span
+                  className="rounded border border-bg-border bg-bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-ink-dim"
+                  title={
+                    current.tier
+                      ? `Current chat model (${current.tier})`
+                      : "Current chat model"
+                  }
+                >
+                  {current.model}
+                  {current.tier ? ` · ${current.tier}` : ""}
+                </span>
+              ) : null}
             </div>
             {current?.transcriptPath ? (
               <div className="truncate font-mono text-[11px] text-ink-dim">

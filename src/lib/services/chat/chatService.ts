@@ -19,6 +19,10 @@ import type {
 import type { ParsedNote } from "@/lib/services/vault";
 import { getChatSessionStore } from "./sessionStore";
 import {
+  chooseModelForTurn,
+  resolveTitleAndInitialTier,
+} from "./modelRouter";
+import {
   parseTranscriptMarkdown,
   renderChatMessageMarkdown,
   stripMdExt,
@@ -33,7 +37,7 @@ const DEFAULT_SYSTEM_PROMPT =
 
 /**
  * Budget knobs for rolling-summary context management. The goal is to keep
- * the prompt input under ~100k tokens forever (GPT-4o / Sonnet comfortable
+ * the prompt input under ~180k tokens forever (GPT-4o / Sonnet comfortable
  * range) even on very long chats, without paying the linear cost of resending
  * the full transcript on every turn.
  *
@@ -46,7 +50,7 @@ const DEFAULT_SYSTEM_PROMPT =
  *      tokens.
  *   3. Only the summary + pinned + tail are sent on subsequent turns.
  */
-const TOKEN_HARD_LIMIT = 100_000;
+const TOKEN_HARD_LIMIT = 180_000;
 const COMPACT_TRIGGER_TOKENS = 80_000;
 const KEEP_TAIL_MESSAGES = 10;
 /** Safety floor: don't attempt to compact when there's barely anything. */
@@ -63,11 +67,6 @@ const ROLLING_SUMMARY_SYSTEM_PROMPT =
   "paragraphs. No headings, no bullet lists, no preamble, no meta " +
   "commentary. Do not invent anything that isn't in the prior summary or " +
   "the new turns.";
-
-const CHAT_TITLE_SYSTEM_PROMPT =
-  "Generate a short chat title from the first user message. " +
-  "Output only the title text. Keep it in the same language as the user " +
-  "message. 3-8 words. No quotes, no emoji, no trailing punctuation.";
 
 export interface CreateSessionInput {
   title?: string;
@@ -157,6 +156,11 @@ export interface SessionTokenUsage {
   limitTokens: number;
 }
 
+interface SessionModelInfo {
+  model?: string;
+  tier?: "fast" | "standard" | "reasoning";
+}
+
 export interface ChatService {
   ensureReady(): Promise<void>;
   createSession(input?: CreateSessionInput): Promise<ChatSession>;
@@ -179,6 +183,7 @@ export interface ChatService {
    * Cheap pure function — safe to call from list/GET endpoints.
    */
   estimateNextPromptTokens(session: ChatSession): number;
+  getSessionModelInfo(session: ChatSession): SessionModelInfo;
   /**
    * Streams the assistant response for a new user message. For
    * `agentEnabled` sessions the stream carries `kind: "agent"` frames
@@ -370,6 +375,18 @@ class ChatServiceImpl implements ChatService {
         : undefined;
 
     const chatSummary = parseChatSummaryFrontmatter(data);
+    const lastModel =
+      typeof data.chat_model_last === "string" &&
+      data.chat_model_last.trim().length > 0
+        ? data.chat_model_last.trim()
+        : undefined;
+    const lastTierRaw = data.chat_model_tier_last;
+    const lastTier =
+      lastTierRaw === "fast" ||
+      lastTierRaw === "standard" ||
+      lastTierRaw === "reasoning"
+        ? lastTierRaw
+        : undefined;
 
     return {
       id,
@@ -384,6 +401,14 @@ class ChatServiceImpl implements ChatService {
       summaryUpTo,
       totalTokensUsed,
       chatSummary,
+      modelRoutingState:
+        lastModel || lastTier
+          ? {
+              model: lastModel ?? cfg.openai.chatModel,
+              tier: lastTier ?? "standard",
+              stickyTurnsLeft: 0,
+            }
+          : undefined,
     };
   }
 
@@ -559,6 +584,10 @@ class ChatServiceImpl implements ChatService {
       patch.chat_summary_provider = session.chatSummary.provider;
       patch.chat_summary_model = session.chatSummary.model;
     }
+    if (session.modelRoutingState) {
+      patch.chat_model_last = session.modelRoutingState.model;
+      patch.chat_model_tier_last = session.modelRoutingState.tier;
+    }
     try {
       await this.vault.updateFrontmatter(session.transcriptPath, patch);
     } catch (err) {
@@ -667,6 +696,13 @@ class ChatServiceImpl implements ChatService {
     return estimateTokensForMessages(messages);
   }
 
+  getSessionModelInfo(session: ChatSession): SessionModelInfo {
+    return {
+      model: session.modelRoutingState?.model ?? cfg.openai.chatModel,
+      tier: session.modelRoutingState?.tier,
+    };
+  }
+
   async *streamUserMessage(input: AppendMessageInput): AsyncIterable<StreamEvent> {
     await this.ensureReady();
     let session = this.store.get(input.sessionId);
@@ -704,6 +740,14 @@ class ChatServiceImpl implements ChatService {
 
     const systemPrompt =
       this.store.getSystemPrompt(session.id) ?? DEFAULT_SYSTEM_PROMPT;
+    const llm = llmProviderFactory.get();
+    const route = chooseModelForTurn({
+      session,
+      userText: input.content,
+      systemPrompt,
+      defaultModel: llm.defaultModel,
+      preferredTier: session.modelRoutingState?.tier,
+    });
 
     // Compact BEFORE building the prompt so the new user message participates
     // in the decision on whether we've hit the trigger. The summary already
@@ -712,11 +756,11 @@ class ChatServiceImpl implements ChatService {
     await this.maybeCompact(session, systemPrompt);
 
     if (session.agentEnabled) {
-      yield* this.streamAgentTurn(session, systemPrompt, tTurn);
+      yield* this.streamAgentTurn(session, systemPrompt, route.model, tTurn);
       return;
     }
 
-    yield* this.streamPlainTurn(session, systemPrompt, tTurn);
+    yield* this.streamPlainTurn(session, systemPrompt, route.model, tTurn);
   }
 
   /**
@@ -736,16 +780,27 @@ class ChatServiceImpl implements ChatService {
     const llm = llmProviderFactory.get();
     let nextTitle = "";
     try {
-      const res = await llm.sendMessage({
-        model: cfg.openai.chatNamingModel,
-        temperature: 0.1,
-        maxOutputTokens: 24,
-        messages: [
-          { role: "system", content: CHAT_TITLE_SYSTEM_PROMPT },
-          { role: "user", content: source },
-        ],
-      });
-      nextTitle = sanitizeGeneratedTitle(res.content);
+      const routed = await resolveTitleAndInitialTier(llm, source);
+      if (routed?.title) {
+        nextTitle = sanitizeGeneratedTitle(routed.title);
+      }
+      if (routed?.tier) {
+        const seeded = chooseModelForTurn({
+          session,
+          userText: source,
+          systemPrompt: this.store.getSystemPrompt(session.id) ?? DEFAULT_SYSTEM_PROMPT,
+          defaultModel: llm.defaultModel,
+          preferredTier: routed.tier,
+        });
+        session.modelRoutingState = {
+          model: seeded.model,
+          tier: seeded.tier,
+          stickyTurnsLeft: Math.max(
+            0,
+            cfg.modelRouting.stickyTurns - 1
+          ),
+        };
+      }
     } catch (err) {
       log.warn("autoRename: title generation failed", {
         sessionId: session.id,
@@ -821,6 +876,7 @@ class ChatServiceImpl implements ChatService {
   private async *streamPlainTurn(
     session: ChatSession,
     systemPrompt: string,
+    modelOverride: string,
     tTurn: ReturnType<typeof log.time>
   ): AsyncIterable<ChatStreamEvent> {
     const llmMessages = this.buildPromptMessages(session, systemPrompt);
@@ -834,7 +890,10 @@ class ChatServiceImpl implements ChatService {
 
     const llm = llmProviderFactory.get();
     try {
-      for await (const frame of llm.streamMessage({ messages: llmMessages })) {
+      for await (const frame of llm.streamMessage({
+        model: modelOverride,
+        messages: llmMessages,
+      })) {
         if (frame.usage) lastUsage = frame.usage;
         if (!frame.delta) continue;
         if (firstChunkAt === undefined) firstChunkAt = Date.now();
@@ -930,6 +989,7 @@ class ChatServiceImpl implements ChatService {
   private async *streamAgentTurn(
     session: ChatSession,
     systemPrompt: string,
+    modelOverride: string,
     tTurn: ReturnType<typeof log.time>
   ): AsyncIterable<ChatAgentStreamEvent> {
     const userMessage = session.messages[session.messages.length - 1]!;
@@ -946,7 +1006,12 @@ class ChatServiceImpl implements ChatService {
       for await (const ev of runTurn({
         sessionId: session.id,
         userText: userMessage.content,
-        priorContext: { history: priorHistory, systemSuffix, allowedTools },
+        priorContext: {
+          history: priorHistory,
+          systemSuffix,
+          allowedTools,
+          modelOverride,
+        },
       })) {
         yielded = true;
         await this.handleAgentEvent(session, ev);
@@ -1044,6 +1109,14 @@ class ChatServiceImpl implements ChatService {
 
     const systemPrompt =
       this.store.getSystemPrompt(session.id) ?? DEFAULT_SYSTEM_PROMPT;
+    const llm = llmProviderFactory.get();
+    const route = chooseModelForTurn({
+      session,
+      userText: "",
+      systemPrompt,
+      defaultModel: llm.defaultModel,
+      preferredTier: session.modelRoutingState?.tier,
+    });
     const priorHistory = chatHistoryToAgentMessages(session.messages);
     const systemSuffix = this.buildAgentSystemSuffix(session, systemPrompt);
     const allowedTools = this.buildAgentAllowedTools(session);
@@ -1056,7 +1129,12 @@ class ChatServiceImpl implements ChatService {
       for await (const ev of confirmTurn({
         sessionId: session.id,
         token: input.token,
-        priorContext: { history: priorHistory, systemSuffix, allowedTools },
+        priorContext: {
+          history: priorHistory,
+          systemSuffix,
+          allowedTools,
+          modelOverride: route.model,
+        },
       })) {
         await this.handleAgentEvent(session, ev);
         if (ev.type === "message_delta") {

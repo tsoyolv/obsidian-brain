@@ -88,6 +88,15 @@ export interface ChatSession {
    * visible in Obsidian too. Absent until the user asks for one.
    */
   chatSummary?: ChatSummary;
+  /**
+   * In-memory state for model routing stickiness/escalation.
+   * Not persisted to transcript frontmatter.
+   */
+  modelRoutingState?: {
+    model: string;
+    tier: "fast" | "standard" | "reasoning";
+    stickyTurnsLeft: number;
+  };
 }
 
 export interface ChatSummary {

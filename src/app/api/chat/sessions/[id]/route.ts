@@ -25,6 +25,7 @@ export async function GET(
     const session = await chat.getSession(id);
     if (!session) return fail(`Unknown chat session: ${id}`, 404);
     return ok({
+      ...chat.getSessionModelInfo(session),
       id: session.id,
       title: session.title,
       createdAt: session.createdAt,
@@ -67,6 +68,7 @@ export async function PATCH(
       session = await chat.setWebSearchEnabled(id, patch.webSearchEnabled);
     }
     return ok({
+      ...chat.getSessionModelInfo(session),
       id: session.id,
       title: session.title,
       createdAt: session.createdAt,

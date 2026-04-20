@@ -47,7 +47,7 @@ const MAX_INVALID_ARGS_RETRIES = 1;
  * the orchestrator itself doesn't enforce a token ceiling at this layer
  * (the rolling history cap is the structural bound).
  */
-export const AGENT_TOKEN_LIMIT = 100_000;
+export const AGENT_TOKEN_LIMIT = 180_000;
 
 const SYSTEM_PROMPT = [
   "You are an agent for the user's personal Obsidian-backed brain.",
@@ -138,6 +138,8 @@ export interface PriorContext {
    * unavailable.
    */
   allowedTools?: string[];
+  /** Optional model override for this turn. */
+  modelOverride?: string;
 }
 
 export interface RunTurnInput {
@@ -199,6 +201,7 @@ export async function* runTurn(
   }
   const systemSuffix = input.priorContext?.systemSuffix;
   const allowedTools = input.priorContext?.allowedTools;
+  const modelOverride = input.priorContext?.modelOverride;
 
   // (1) Drop pending if it has expired or already had its grace turn. We
   // do this BEFORE matching so a stale yes/no can't accidentally trigger
@@ -212,7 +215,13 @@ export async function* runTurn(
     const intent = parseUserIntent(userText, pendingAtStart.candidates);
     if (intent.kind !== "none") {
       sessions.appendMessage(session.id, { role: "user", content: userText });
-      yield* resolveFromPending(session.id, pendingAtStart, intent, allowedTools);
+      yield* resolveFromPending(
+        session.id,
+        pendingAtStart,
+        intent,
+        allowedTools,
+        modelOverride
+      );
       return;
     }
   }
@@ -226,7 +235,13 @@ export async function* runTurn(
     hasPending: Boolean(pendingAtStart),
   });
 
-  yield* iterativeLoop(session.id, pendingAtStart, systemSuffix, allowedTools);
+  yield* iterativeLoop(
+    session.id,
+    pendingAtStart,
+    systemSuffix,
+    allowedTools,
+    modelOverride
+  );
 
   // (4) If the pending we entered with is STILL there at end-of-turn, it
   // got injected as context but was neither matched nor consumed. Mark it
@@ -278,6 +293,7 @@ export async function* confirmTurn(
   }
   const systemSuffix = input.priorContext?.systemSuffix;
   const allowedTools = input.priorContext?.allowedTools;
+  const modelOverride = input.priorContext?.modelOverride;
   const pending = session.pendingConfirmation;
 
   if (!pending || pending.token !== input.token) {
@@ -315,7 +331,13 @@ export async function* confirmTurn(
   // be retried.
   const argsWithToken = injectConfirmationToken(pending.args, pending.token);
   yield* runToolAndYield(session.id, tool, argsWithToken);
-  yield* iterativeLoop(session.id, undefined, systemSuffix, allowedTools);
+  yield* iterativeLoop(
+    session.id,
+    undefined,
+    systemSuffix,
+    allowedTools,
+    modelOverride
+  );
 
   t.done("confirmTurn", {
     sessionId: session.id,
@@ -358,7 +380,8 @@ async function* iterativeLoop(
   sessionId: string,
   pendingContext?: PendingConfirmation,
   systemSuffix?: string,
-  allowedTools?: string[]
+  allowedTools?: string[],
+  modelOverride?: string
 ): AsyncGenerator<AgentEvent, void, void> {
   const sessions = getAgentSessionStore();
   const llm = llmProviderFactory.get();
@@ -385,6 +408,7 @@ async function* iterativeLoop(
     // we just ran, or replaced by a new gated call.
     const livePending = session.pendingConfirmation ?? pendingContext;
     const chatInput: ChatInput = {
+      model: modelOverride,
       temperature: 0.2,
       messages: buildPromptMessages(session.messages, livePending, systemSuffix),
     };
@@ -501,7 +525,12 @@ async function* iterativeLoop(
 
       invalidArgsRetries += 1;
       if (invalidArgsRetries > MAX_INVALID_ARGS_RETRIES) {
-        const summary = await finalSummary(sessionId, livePending, systemSuffix);
+        const summary = await finalSummary(
+          sessionId,
+          livePending,
+          systemSuffix,
+          modelOverride
+        );
         yield {
           type: "final",
           message:
@@ -573,7 +602,8 @@ async function* resolveFromPending(
   sessionId: string,
   pending: PendingConfirmation,
   intent: UserIntent,
-  allowedTools?: string[]
+  allowedTools?: string[],
+  modelOverride?: string
 ): AsyncGenerator<AgentEvent, void, void> {
   const sessions = getAgentSessionStore();
 
@@ -641,7 +671,13 @@ async function* resolveFromPending(
 
   const argsWithToken = injectConfirmationToken(args, pending.token);
   yield* runToolAndYield(sessionId, tool, argsWithToken);
-  yield* iterativeLoop(sessionId, undefined, undefined, allowedTools);
+  yield* iterativeLoop(
+    sessionId,
+    undefined,
+    undefined,
+    allowedTools,
+    modelOverride
+  );
 }
 
 /**
@@ -886,7 +922,8 @@ async function* runToolAndYield(
 async function finalSummary(
   sessionId: string,
   pendingContext?: PendingConfirmation,
-  systemSuffix?: string
+  systemSuffix?: string,
+  modelOverride?: string
 ): Promise<string> {
   const sessions = getAgentSessionStore();
   const llm = llmProviderFactory.get();
@@ -894,6 +931,7 @@ async function finalSummary(
   if (!session) return "(no session)";
   try {
     const resp = await llm.sendMessage({
+      model: modelOverride,
       temperature: 0.2,
       messages: buildPromptMessages(session.messages, pendingContext, systemSuffix),
     });

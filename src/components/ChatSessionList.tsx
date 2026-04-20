@@ -12,6 +12,8 @@ export interface SessionSummary {
   webSearchEnabled?: boolean;
   totalTokensUsed?: number;
   nextPromptEstimateTokens?: number;
+  model?: string;
+  tier?: "fast" | "standard" | "reasoning";
 }
 
 export type SessionSortMode =

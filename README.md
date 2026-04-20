@@ -98,6 +98,14 @@ Required variables:
 | `STT_PROVIDER`         | `openai` (only provider in MVP).                         |
 | `OPENAI_API_KEY`       | Your OpenAI API key.                                     |
 | `OPENAI_MODEL_CHAT`    | Chat/completions model (e.g. `gpt-4o-mini`).             |
+| `OPENAI_MODEL_CHAT_FAST` | Fast/cheap model for simple turns.                     |
+| `OPENAI_MODEL_CHAT_STANDARD` | Default model for normal turns.                   |
+| `OPENAI_MODEL_CHAT_REASONING` | Strong model for complex/high-risk turns.        |
+| `OPENAI_MODEL_ROUTER`  | Router model for first-turn title + complexity triage.   |
+| `MODEL_ROUTING_ENABLED` | Enables model routing (`true`/`false`).                |
+| `MODEL_DYNAMIC_ESCALATION_ENABLED` | Escalates model on failure/complexity signals. |
+| `MODEL_ROUTING_STICKY_TURNS` | How many turns to keep a chosen model.           |
+| `MODEL_ROUTING_HIGH_PROMPT_TOKENS` | Prompt-size threshold for reasoning tier.  |
 | `WEB_SEARCH_PROVIDER`  | Web search provider id (`tavily`).                       |
 | `TAVILY_API_KEY`       | API key for Tavily web search tool.                      |
 | `OPENAI_MODEL_STT`     | Whisper model id (e.g. `whisper-1`).                     |

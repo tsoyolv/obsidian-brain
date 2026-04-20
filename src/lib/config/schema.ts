@@ -22,8 +22,20 @@ export const EnvSchema = z.object({
   WEB_SEARCH_PROVIDER: WebSearchProviderSchema.default("tavily"),
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_MODEL_CHAT: z.string().default("gpt-4o-mini"),
-  OPENAI_MODEL_CHAT_NAMING: z.string().default("gpt-4o-mini"),
+  OPENAI_MODEL_CHAT_FAST: z.string().default("gpt-4o-mini"),
+  OPENAI_MODEL_CHAT_STANDARD: z.string().default("gpt-4o-mini"),
+  OPENAI_MODEL_CHAT_REASONING: z.string().default("gpt-5.2"),
+  OPENAI_MODEL_ROUTER: z.string().default("gpt-4o-mini"),
   OPENAI_MODEL_STT: z.string().default("whisper-1"),
+  MODEL_ROUTING_ENABLED: z.coerce.boolean().default(true),
+  MODEL_DYNAMIC_ESCALATION_ENABLED: z.coerce.boolean().default(true),
+  MODEL_ROUTING_STICKY_TURNS: z.coerce.number().int().min(0).max(20).default(3),
+  MODEL_ROUTING_HIGH_PROMPT_TOKENS: z.coerce
+    .number()
+    .int()
+    .min(1000)
+    .max(500000)
+    .default(40000),
   TAVILY_API_KEY: z.string().optional(),
 });
 

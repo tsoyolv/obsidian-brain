@@ -24,8 +24,17 @@ export interface AppConfig {
   openai: {
     apiKey: string | undefined;
     chatModel: string;
-    chatNamingModel: string;
+    chatFastModel: string;
+    chatStandardModel: string;
+    chatReasoningModel: string;
+    routerModel: string;
     sttModel: string;
+  };
+  modelRouting: {
+    enabled: boolean;
+    dynamicEscalationEnabled: boolean;
+    stickyTurns: number;
+    highPromptTokens: number;
   };
   tavily: {
     apiKey: string | undefined;
@@ -44,8 +53,17 @@ export function getConfig(): AppConfig {
     WEB_SEARCH_PROVIDER: process.env.WEB_SEARCH_PROVIDER,
     OPENAI_API_KEY: process.env.OPENAI_API_KEY,
     OPENAI_MODEL_CHAT: process.env.OPENAI_MODEL_CHAT,
-    OPENAI_MODEL_CHAT_NAMING: process.env.OPENAI_MODEL_CHAT_NAMING,
+    OPENAI_MODEL_CHAT_FAST: process.env.OPENAI_MODEL_CHAT_FAST,
+    OPENAI_MODEL_CHAT_STANDARD: process.env.OPENAI_MODEL_CHAT_STANDARD,
+    OPENAI_MODEL_CHAT_REASONING: process.env.OPENAI_MODEL_CHAT_REASONING,
+    OPENAI_MODEL_ROUTER: process.env.OPENAI_MODEL_ROUTER,
     OPENAI_MODEL_STT: process.env.OPENAI_MODEL_STT,
+    MODEL_ROUTING_ENABLED: process.env.MODEL_ROUTING_ENABLED,
+    MODEL_DYNAMIC_ESCALATION_ENABLED:
+      process.env.MODEL_DYNAMIC_ESCALATION_ENABLED,
+    MODEL_ROUTING_STICKY_TURNS: process.env.MODEL_ROUTING_STICKY_TURNS,
+    MODEL_ROUTING_HIGH_PROMPT_TOKENS:
+      process.env.MODEL_ROUTING_HIGH_PROMPT_TOKENS,
     TAVILY_API_KEY: process.env.TAVILY_API_KEY,
   });
 
@@ -65,8 +83,17 @@ export function getConfig(): AppConfig {
     openai: {
       apiKey: env.OPENAI_API_KEY,
       chatModel: env.OPENAI_MODEL_CHAT,
-      chatNamingModel: env.OPENAI_MODEL_CHAT_NAMING,
+      chatFastModel: env.OPENAI_MODEL_CHAT_FAST,
+      chatStandardModel: env.OPENAI_MODEL_CHAT_STANDARD,
+      chatReasoningModel: env.OPENAI_MODEL_CHAT_REASONING,
+      routerModel: env.OPENAI_MODEL_ROUTER,
       sttModel: env.OPENAI_MODEL_STT,
+    },
+    modelRouting: {
+      enabled: env.MODEL_ROUTING_ENABLED,
+      dynamicEscalationEnabled: env.MODEL_DYNAMIC_ESCALATION_ENABLED,
+      stickyTurns: env.MODEL_ROUTING_STICKY_TURNS,
+      highPromptTokens: env.MODEL_ROUTING_HIGH_PROMPT_TOKENS,
     },
     tavily: {
       apiKey: env.TAVILY_API_KEY,

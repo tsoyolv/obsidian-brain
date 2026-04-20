@@ -17,6 +17,7 @@ export async function GET() {
     const chat = getChatService();
     const all = await chat.listSessions();
     const sessions = all.map((s) => ({
+      ...chat.getSessionModelInfo(s),
       id: s.id,
       title: s.title,
       createdAt: s.createdAt,
@@ -46,6 +47,7 @@ export async function POST(req: Request) {
     const chat = getChatService();
     const session = await chat.createSession(input);
     return ok({
+      ...chat.getSessionModelInfo(session),
       id: session.id,
       title: session.title,
       createdAt: session.createdAt,
