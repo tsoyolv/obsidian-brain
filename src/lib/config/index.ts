@@ -36,6 +36,13 @@ export interface AppConfig {
     stickyTurns: number;
     highPromptTokens: number;
   };
+  fileRead: {
+    autoReadMaxChars: number;
+    previewTotalChars: number;
+  };
+  tasks: {
+    archiveDoneThreshold: number;
+  };
   tavily: {
     apiKey: string | undefined;
   };
@@ -64,6 +71,9 @@ export function getConfig(): AppConfig {
     MODEL_ROUTING_STICKY_TURNS: process.env.MODEL_ROUTING_STICKY_TURNS,
     MODEL_ROUTING_HIGH_PROMPT_TOKENS:
       process.env.MODEL_ROUTING_HIGH_PROMPT_TOKENS,
+    FILE_AUTO_READ_MAX_CHARS: process.env.FILE_AUTO_READ_MAX_CHARS,
+    FILE_PREVIEW_TOTAL_CHARS: process.env.FILE_PREVIEW_TOTAL_CHARS,
+    TASK_ARCHIVE_DONE_THRESHOLD: process.env.TASK_ARCHIVE_DONE_THRESHOLD,
     TAVILY_API_KEY: process.env.TAVILY_API_KEY,
   });
 
@@ -94,6 +104,13 @@ export function getConfig(): AppConfig {
       dynamicEscalationEnabled: env.MODEL_DYNAMIC_ESCALATION_ENABLED,
       stickyTurns: env.MODEL_ROUTING_STICKY_TURNS,
       highPromptTokens: env.MODEL_ROUTING_HIGH_PROMPT_TOKENS,
+    },
+    fileRead: {
+      autoReadMaxChars: env.FILE_AUTO_READ_MAX_CHARS,
+      previewTotalChars: env.FILE_PREVIEW_TOTAL_CHARS,
+    },
+    tasks: {
+      archiveDoneThreshold: env.TASK_ARCHIVE_DONE_THRESHOLD,
     },
     tavily: {
       apiKey: env.TAVILY_API_KEY,

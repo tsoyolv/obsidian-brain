@@ -1,4 +1,6 @@
 import { llmProviderFactory } from "@/lib/providers/llm";
+import { getConfig } from "@/lib/config";
+import { getVaultService } from "@/lib/services/vault";
 import type {
   ChatInput,
   LLMMessage,
@@ -31,6 +33,7 @@ const log = createLogger("agentOrchestrator");
  * 4.
  */
 const MAX_TOOL_CALLS_PER_TURN = 4;
+const TOOL_RESULT_TEXT_MAX_CHARS = 1500;
 
 /**
  * On invalid LLM-supplied tool arguments we feed the validation error back
@@ -60,6 +63,8 @@ const SYSTEM_PROMPT = [
   "  * You NEVER hard-delete files. `soft_delete` only.",
   "  * You NEVER set the `confirmationToken` parameter on any tool — the",
   "    orchestrator injects it after the user explicitly approves.",
+  "  * NEVER ask for confirmation in plain text. If an action is confirmation-",
+  "    gated, call the tool directly so the UI can show Confirm/Cancel buttons.",
   "",
   "You may chain MULTIPLE tool calls in one turn (e.g. find_file →",
   "propose_open_file). When you have everything you need, stop calling tools",
@@ -209,21 +214,17 @@ export async function* runTurn(
   discardStalePending(session.id);
   const pendingAtStart = sessions.get(session.id)?.pendingConfirmation;
 
-  // (2) Try to resolve a live pending from the user's natural-language
-  // input. Affirmative / negative / ordinal cues short-circuit the LLM.
+  // (2) Button-only confirmation UX:
+  // if there's a live pending action, we do NOT parse natural-language
+  // "yes/no" replies. The user must use explicit Confirm/Cancel buttons.
   if (pendingAtStart) {
-    const intent = parseUserIntent(userText, pendingAtStart.candidates);
-    if (intent.kind !== "none") {
-      sessions.appendMessage(session.id, { role: "user", content: userText });
-      yield* resolveFromPending(
-        session.id,
-        pendingAtStart,
-        intent,
-        allowedTools,
-        modelOverride
-      );
-      return;
-    }
+    sessions.appendMessage(session.id, { role: "user", content: userText });
+    yield {
+      type: "final",
+      message:
+        "Для этого действия используй кнопки Confirm/Cancel в карточке подтверждения.",
+    };
+    return;
   }
 
   sessions.appendMessage(session.id, { role: "user", content: userText });
@@ -237,19 +238,11 @@ export async function* runTurn(
 
   yield* iterativeLoop(
     session.id,
-    pendingAtStart,
+    undefined,
     systemSuffix,
     allowedTools,
     modelOverride
   );
-
-  // (4) If the pending we entered with is STILL there at end-of-turn, it
-  // got injected as context but was neither matched nor consumed. Mark it
-  // so the next turn discards it.
-  const after = sessions.get(session.id)?.pendingConfirmation;
-  if (after && pendingAtStart && after.token === pendingAtStart.token) {
-    sessions.markPendingStale(session.id);
-  }
 
   t.done("runTurn", {
     sessionId: session.id,
@@ -549,6 +542,7 @@ async function* iterativeLoop(
       const candidates = findLatestCandidates(
         sessions.get(sessionId)?.messages ?? []
       );
+      const preview = await buildConfirmationPreview(tool.name, validatedArgs);
       const now = new Date();
       const pending: PendingConfirmation = {
         token,
@@ -572,7 +566,7 @@ async function* iterativeLoop(
         token,
         toolName: tool.name,
         args: validatedArgs,
-        preview: validatedArgs,
+        preview,
         candidates,
       };
       // Stop the loop; resumption happens via confirmTurn OR via a
@@ -904,13 +898,16 @@ async function* runToolAndYield(
     result = { ok: false, error: errMsg };
   }
 
+  const historyResult = sanitizeToolResultForHistory(tool.name, result);
   sessions.appendMessage(sessionId, {
     role: "tool_result",
     id: callId,
     toolName: tool.name,
-    result,
+    result: historyResult,
   });
-  yield { type: "tool_result", callId, name: tool.name, result };
+  // Stream the same compacted payload so chat transcripts and UI tool cards
+  // don't store/render full raw file bodies.
+  yield { type: "tool_result", callId, name: tool.name, result: historyResult };
 }
 
 /**
@@ -1082,4 +1079,88 @@ function stringifyArgs(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+async function buildConfirmationPreview(
+  toolName: string,
+  args: unknown
+): Promise<unknown> {
+  if (toolName !== "read_confirmed_file") return args;
+  if (!args || typeof args !== "object") return args;
+  const obj = args as Record<string, unknown>;
+  const path = typeof obj.path === "string" ? obj.path : undefined;
+  if (!path) return args;
+  try {
+    const cfg = getConfig();
+    const vault = getVaultService();
+    const safePath = vault.safePathResolve(path);
+    const stat = await vault.statFile(safePath);
+    return {
+      ...obj,
+      needsConfirmationReason:
+        "full file read requested (confirmation-gated operation)",
+      fileSizeBytes: stat.size,
+      autoReadLimitChars: cfg.fileRead.autoReadMaxChars,
+      note:
+        "If a tiny single-hit file is opened via propose_open_file and is <= autoReadLimitChars, it may be auto-read without confirmation.",
+    };
+  } catch {
+    return {
+      ...obj,
+      needsConfirmationReason:
+        "full file read requested (could not stat file size before confirmation)",
+      autoReadLimitChars: getConfig().fileRead.autoReadMaxChars,
+    };
+  }
+}
+
+function sanitizeToolResultForHistory(
+  toolName: string,
+  result: ToolResult<unknown>
+): ToolResult<unknown> {
+  if (!result.ok) return result;
+  if (!result.data || typeof result.data !== "object") return result;
+  const data = result.data as Record<string, unknown>;
+
+  if (toolName === "read_confirmed_file") {
+    // Full confirmed file reads are allowed to flow into history/context.
+    // Confirmation is the gate; once approved, we keep the full body.
+    return result;
+  }
+
+  if (toolName === "propose_open_file") {
+    const autoRead =
+      data.autoRead && typeof data.autoRead === "object"
+        ? (data.autoRead as Record<string, unknown>)
+        : null;
+    if (!autoRead) return result;
+    return {
+      ok: true,
+      data: {
+        ...data,
+        autoRead: {
+          ...autoRead,
+          content: truncateTextField(autoRead.content, TOOL_RESULT_TEXT_MAX_CHARS),
+        },
+      },
+    };
+  }
+
+  if (toolName === "run_file_task") {
+    return {
+      ok: true,
+      data: {
+        ...data,
+        markdown: truncateTextField(data.markdown, TOOL_RESULT_TEXT_MAX_CHARS),
+      },
+    };
+  }
+
+  return result;
+}
+
+function truncateTextField(value: unknown, maxChars: number): unknown {
+  if (typeof value !== "string") return value;
+  if (value.length <= maxChars) return value;
+  return value.slice(0, maxChars) + "\n\n[truncated for token safety]";
 }

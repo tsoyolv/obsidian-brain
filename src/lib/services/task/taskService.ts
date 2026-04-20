@@ -1,4 +1,5 @@
 import { getVaultService, VAULT_FOLDERS } from "@/lib/services/vault";
+import { getConfig } from "@/lib/config";
 import { task as renderTask } from "@/lib/markdown/helpers";
 import { ensureMarkdownExt } from "@/lib/utils/filenames";
 import { createLogger } from "@/lib/utils/logger";
@@ -9,8 +10,13 @@ const log = createLogger("taskService");
  * Default vault-relative file new tasks land in when the caller doesn't
  * specify one. Plain markdown so it shows up cleanly in Obsidian.
  */
-export const DEFAULT_TASK_FILE = `${VAULT_FOLDERS.tasks}/Inbox.md`;
-const DEFAULT_TASK_FILE_HEADER = `# Tasks Inbox\n\n`;
+export const DEFAULT_TASK_FILE = `${VAULT_FOLDERS.tasks}/tasks.md`;
+const DEFAULT_TASK_FILE_HEADER = `# Tasks\n\n`;
+const ARCHIVE_FOLDER = `${VAULT_FOLDERS.tasks}/archive`;
+const TASK_IGNORED_TOP_LEVEL_FOLDERS = new Set<string>([
+  VAULT_FOLDERS.aiChats,
+  "AI Summaries",
+]);
 
 export interface TaskHit {
   /** Vault-relative path. */
@@ -25,7 +31,7 @@ export interface TaskHit {
 
 export interface CreateTaskInput {
   /**
-   * Vault-relative path. If omitted, defaults to `Tasks/Inbox.md`.
+   * Vault-relative path. If omitted, defaults to `Tasks/tasks.md`.
    * The file is created (with a heading) if it doesn't exist yet.
    */
   targetFile?: string;
@@ -43,7 +49,7 @@ export type CompleteTaskResult =
   | { status: "not_found" };
 
 export interface TaskService {
-  /** Append `- [ ] <text>` to `targetFile` (default `Tasks/Inbox.md`). */
+  /** Append `- [ ] <text>` to `targetFile` (default `Tasks/tasks.md`). */
   createTask(input: CreateTaskInput): Promise<CreateTaskResult>;
   /**
    * Fuzzy-match an OPEN task by `searchText`. If exactly one strong match is
@@ -56,6 +62,15 @@ export interface TaskService {
   findTasks(query: string): Promise<TaskHit[]>;
   /** All open `- [ ]` tasks across the vault, in walk order. */
   listOpenTasks(): Promise<TaskHit[]>;
+  /**
+   * Force archive completed tasks from the target file (or default tasks file)
+   * regardless of how many done items are present.
+   */
+  archiveTasksNow(targetFile?: string): Promise<{
+    sourcePath: string;
+    archivePath: string | null;
+    archivedCount: number;
+  }>;
 }
 
 /**
@@ -68,6 +83,7 @@ const TASK_LINE_RE = /^(\s*)([-*])\s+\[( |x|X)\]\s+(.+?)\s*$/;
 
 class TaskServiceImpl implements TaskService {
   private readonly vault = getVaultService();
+  private readonly archiveDoneThreshold = getConfig().tasks.archiveDoneThreshold;
 
   async createTask(input: CreateTaskInput): Promise<CreateTaskResult> {
     const text = input.text.trim();
@@ -126,6 +142,7 @@ class TaskServiceImpl implements TaskService {
 
     const hit = matches[0]!;
     await this.markTaskDone(hit);
+    await this.archiveCompletedTasks(hit.path);
     t.done("completeTask", {
       path: hit.path,
       line: hit.line,
@@ -151,6 +168,17 @@ class TaskServiceImpl implements TaskService {
     return open;
   }
 
+  async archiveTasksNow(targetFile?: string): Promise<{
+    sourcePath: string;
+    archivePath: string | null;
+    archivedCount: number;
+  }> {
+    const sourcePath = targetFile
+      ? this.vault.safePathResolve(ensureMarkdownExt(targetFile))
+      : DEFAULT_TASK_FILE;
+    return this.archiveCompletedTasks(sourcePath, { force: true });
+  }
+
   /**
    * Walk every markdown file in the vault and parse out task lines.
    * `vault.listFiles()` invoked without a folder argument already prunes the
@@ -162,6 +190,10 @@ class TaskServiceImpl implements TaskService {
     const out: TaskHit[] = [];
 
     for (const rel of files) {
+      const top = topLevelFolder(rel);
+      if (top && TASK_IGNORED_TOP_LEVEL_FOLDERS.has(top)) {
+        continue;
+      }
       let raw: string;
       try {
         ({ raw } = await this.vault.readNote(rel));
@@ -191,6 +223,54 @@ class TaskServiceImpl implements TaskService {
     const updated = hit.raw.replace(/\[( |x|X)\]/, "[x]");
     if (updated === hit.raw) return;
     await this.vault.replaceLine(hit.path, hit.line, updated);
+  }
+
+  /**
+   * Keep task files manageable by moving completed lines into a monthly archive
+   * once enough done items accumulate in the source file.
+   */
+  private async archiveCompletedTasks(
+    relPath: string,
+    options: { force?: boolean } = {}
+  ): Promise<{ sourcePath: string; archivePath: string | null; archivedCount: number }> {
+    const { raw } = await this.vault.readNote(relPath);
+    const lines = raw.split(/\r?\n/);
+    const doneIndexes: number[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const m = TASK_LINE_RE.exec(lines[i] ?? "");
+      if (!m) continue;
+      const done = (m[3] ?? " ").toLowerCase() === "x";
+      if (done) doneIndexes.push(i);
+    }
+    if (!options.force && doneIndexes.length < this.archiveDoneThreshold) {
+      return { sourcePath: relPath, archivePath: null, archivedCount: 0 };
+    }
+    if (doneIndexes.length === 0) {
+      return { sourcePath: relPath, archivePath: null, archivedCount: 0 };
+    }
+
+    const doneLines = doneIndexes.map((idx) => lines[idx]!).filter(Boolean);
+    const monthKey = currentMonthKey();
+    const archivePath = `${ARCHIVE_FOLDER}/${monthKey}.md`;
+    await this.vault.ensureNoteExists(
+      archivePath,
+      `# Archived tasks ${monthKey}\n\n`
+    );
+    await this.vault.appendToNote(
+      archivePath,
+      [`## ${relPath}`, ...doneLines, ""].join("\n")
+    );
+
+    const doneSet = new Set(doneIndexes);
+    const kept = lines.filter((_, idx) => !doneSet.has(idx)).join("\n");
+    await this.vault.writeRawNote(relPath, kept);
+    log.info("archiveCompletedTasks", {
+      source: relPath,
+      archived: doneLines.length,
+      archivePath,
+      force: Boolean(options.force),
+    });
+    return { sourcePath: relPath, archivePath, archivedCount: doneLines.length };
   }
 }
 
@@ -247,4 +327,16 @@ function fuzzyMatch(tasks: TaskHit[], needle: string): TaskHit[] {
   const second = scored[1]!.score;
   if (top >= second + 5) return [scored[0]!.hit];
   return scored.filter((s) => s.score >= top - 2).map((s) => s.hit);
+}
+
+function currentMonthKey(): string {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  return `${yyyy}-${mm}`;
+}
+
+function topLevelFolder(relPath: string): string | undefined {
+  const segs = relPath.split(/[\\/]/).filter(Boolean);
+  return segs[0];
 }

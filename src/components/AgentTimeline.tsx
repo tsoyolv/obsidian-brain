@@ -175,12 +175,6 @@ function extractInlineContent(
     const md = obj.markdown;
     return typeof md === "string" && md.trim().length > 0 ? md : undefined;
   }
-  if (step.name === "read_confirmed_file") {
-    const content = obj.content;
-    return typeof content === "string" && content.trim().length > 0
-      ? content
-      : undefined;
-  }
   if (step.name === "answer_from_vault") {
     const ans = obj.answer;
     return typeof ans === "string" && ans.trim().length > 0 ? ans : undefined;

@@ -26,7 +26,9 @@ const ParamsSchema = z.object({
 /**
  * Steps 1–3 of the file-candidate workflow: filename search + LLM ranking.
  * Read-only — NO file body is read here. The orchestrator surfaces the
- * `bestGuess` to the user; an actual read requires `read_confirmed_file`.
+ * `bestGuess` to the user; an actual read usually requires
+ * `read_confirmed_file`. Exception: a tiny single-hit file may be auto-read
+ * under the configured safety threshold.
  */
 export const proposeOpenFileTool: AgentTool<
   z.infer<typeof ParamsSchema>,
@@ -35,8 +37,9 @@ export const proposeOpenFileTool: AgentTool<
   name: "propose_open_file",
   description:
     "Propose a vault file to open for a follow-up task. Returns ranked " +
-    "candidates (filename-only) WITHOUT reading file contents. Always pair " +
-    "with read_confirmed_file once the user confirms the pick.",
+    "candidates (filename-only) plus bounded tiny previews under a strict " +
+    "total char budget for autonomous narrowing. For a tiny single-hit file, " +
+    "content may be auto-read; otherwise pair with read_confirmed_file after confirmation.",
   parameters: ParamsSchema,
   async run(input, ctx) {
     const fileCandidates = getFileCandidateService();

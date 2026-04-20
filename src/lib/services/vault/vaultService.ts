@@ -29,7 +29,7 @@ import { walkMarkdown } from "./internal/walker";
 const log = createLogger("vaultService");
 
 export const VAULT_FOLDERS = {
-  inbox: "Inbox",
+  notes: "Notes",
   aiChats: "AI Chats",
   tasks: "Tasks",
 } as const;

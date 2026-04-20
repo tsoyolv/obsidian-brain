@@ -1,7 +1,9 @@
 import { llmProviderFactory } from "@/lib/providers/llm";
+import { getConfig } from "@/lib/config";
 import { getVaultService } from "@/lib/services/vault";
 import type {
   FileCandidate,
+  FileCandidatePreview,
   FileCandidateResult,
   FileReadResult,
 } from "@/lib/types";
@@ -54,6 +56,8 @@ const DEFAULT_LIMIT = 5;
 
 class FileCandidateServiceImpl implements FileCandidateService {
   private readonly vault = getVaultService();
+  private readonly autoReadMaxChars = getConfig().fileRead.autoReadMaxChars;
+  private readonly previewTotalChars = getConfig().fileRead.previewTotalChars;
 
   async findCandidates(
     input: FindCandidatesInput
@@ -86,12 +90,19 @@ class FileCandidateServiceImpl implements FileCandidateService {
     // Single hit ⇒ that's the best guess; no need to spend an LLM call.
     if (candidates.length === 1) {
       const only = { ...candidates[0]!, isBestGuess: true };
+      const autoRead = await this.tryAutoReadSingleCandidate(only.path, task);
+      const previews = autoRead
+        ? undefined
+        : await this.buildBoundedPreviews([only], this.previewTotalChars);
       return {
         query,
         task,
         candidates: [only],
         bestGuess: only,
-        requiresConfirmation: true,
+        requiresConfirmation: !autoRead,
+        autoRead: autoRead ?? undefined,
+        previews,
+        previewTotalChars: sumPreviewChars(previews),
       };
     }
 
@@ -122,6 +133,10 @@ class FileCandidateServiceImpl implements FileCandidateService {
       c.path === picked.path ? { ...c, isBestGuess: true } : c
     );
 
+    const previews = await this.buildBoundedPreviews(
+      annotated,
+      this.previewTotalChars
+    );
     return {
       query,
       task,
@@ -129,6 +144,8 @@ class FileCandidateServiceImpl implements FileCandidateService {
       bestGuess: { ...picked, isBestGuess: true },
       requiresConfirmation: true,
       reason,
+      previews,
+      previewTotalChars: sumPreviewChars(previews),
     };
   }
 
@@ -148,6 +165,58 @@ class FileCandidateServiceImpl implements FileCandidateService {
       content: note.body,
       task: input.task?.trim() || undefined,
     };
+  }
+
+  private async tryAutoReadSingleCandidate(
+    path: string,
+    task?: string
+  ): Promise<FileReadResult | null> {
+    if (this.autoReadMaxChars <= 0) return null;
+    try {
+      const stat = await this.vault.statFile(path);
+      if (stat.size > this.autoReadMaxChars) return null;
+      const note = await this.vault.readNote(path);
+      if (note.body.length > this.autoReadMaxChars) return null;
+      return {
+        path,
+        title: basenameWithoutMd(path),
+        content: note.body,
+        task: task?.trim() || undefined,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private async buildBoundedPreviews(
+    candidates: FileCandidate[],
+    totalBudget: number
+  ): Promise<FileCandidatePreview[]> {
+    if (totalBudget <= 0) return [];
+    let remaining = totalBudget;
+    const out: FileCandidatePreview[] = [];
+    for (const c of candidates) {
+      if (remaining <= 0) break;
+      let noteBody: string;
+      try {
+        const note = await this.vault.readNote(c.path);
+        noteBody = note.body;
+      } catch {
+        continue;
+      }
+      const excerpt = noteBody.slice(0, remaining);
+      if (!excerpt.trim()) continue;
+      const charsRead = excerpt.length;
+      out.push({
+        path: c.path,
+        title: c.title,
+        excerpt,
+        charsRead,
+        truncated: noteBody.length > charsRead,
+      });
+      remaining -= charsRead;
+    }
+    return out;
   }
 }
 
@@ -169,4 +238,9 @@ function basenameWithoutMd(relPath: string): string {
   const idx = Math.max(relPath.lastIndexOf("/"), relPath.lastIndexOf("\\"));
   const base = idx >= 0 ? relPath.slice(idx + 1) : relPath;
   return base.toLowerCase().endsWith(".md") ? base.slice(0, -3) : base;
+}
+
+function sumPreviewChars(previews?: FileCandidatePreview[]): number {
+  if (!previews || previews.length === 0) return 0;
+  return previews.reduce((acc, p) => acc + p.charsRead, 0);
 }

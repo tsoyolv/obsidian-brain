@@ -33,7 +33,7 @@ export interface ExecuteFileTaskInput {
  *      markdown answer and (for `generate_tasks`) the parsed checklist.
  *
  * The service does NOT itself write anything back to the vault. Acting on
- * generated tasks (e.g. appending to `Tasks/Inbox.md`) is the caller's
+ * generated tasks (e.g. appending to `Tasks/tasks.md`) is the caller's
  * decision — kept explicit to match the project's "no surprise mutations"
  * safety model.
  */

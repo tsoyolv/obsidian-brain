@@ -27,43 +27,45 @@ export interface SaveNoteOutput {
 }
 
 /**
- * Persist a new note to `Inbox/`. Mirrors the `note` capture intent —
- * delegates to `vaultService.createNote`, which enforces the writable-folder
- * allowlist and unique-filename policy. NEVER bypasses the vault service.
+ * Persist notes into a single daily note in `Notes/Daily/YYYY-MM-DD.md`.
+ * This keeps capture low-friction and avoids one-file-per-note churn while
+ * preserving chronological ordering for quick review in Obsidian.
  */
 export const saveNoteTool: AgentTool<z.infer<typeof ParamsSchema>, SaveNoteOutput> = {
   name: "save_note",
   description:
-    "Save a new markdown note to the vault Inbox. Use when the user wants " +
+    "Save captured content into today's daily note in the vault Notes folder. Use when the user wants " +
     "to capture a thought / idea / piece of content as a note.",
   parameters: ParamsSchema,
   async run(input, ctx) {
     const vault = getVaultService();
     const body = input.text.trim();
     const title = (input.title ?? deriveTitle(body)).trim() || "note";
-    const filename = ensureMarkdownExt(`${todayLocalDate()} ${title}`);
-
-    const created = await vault.createNote({
-      folder: VAULT_FOLDERS.inbox,
-      title: filename,
-      content: body,
-      metadata: {
-        type: "note",
-        created: nowIso(),
-        source: "agent",
-        tags: input.tags,
-      },
-      uniqueOnConflict: true,
+    const dailyPath = vault.joinPath(
+      vault.joinPath(VAULT_FOLDERS.notes, "Daily"),
+      ensureMarkdownExt(todayLocalDate())
+    );
+    const entry = renderDailyEntry({
+      title,
+      body,
+      createdIso: nowIso(),
+      tags: input.tags,
     });
 
+    await vault.ensureNoteExists(
+      dailyPath,
+      `# Daily Notes ${todayLocalDate()}\n\n`
+    );
+    await vault.appendToNote(dailyPath, entry);
+
     ctx.logger.info("save_note: created", {
-      path: created.path,
+      path: dailyPath,
       title: sanitizeFilename(title),
       bodyChars: body.length,
       tags: input.tags,
     });
 
-    return { path: created.path, title: sanitizeFilename(title) };
+    return { path: dailyPath, title: sanitizeFilename(title) };
   },
 };
 
@@ -72,4 +74,22 @@ function deriveTitle(text: string): string {
   const trimmed = firstLine.trim().replace(/[#*_>`]+/g, "");
   if (trimmed.length <= 60) return trimmed || "note";
   return trimmed.slice(0, 60).trim() + "…";
+}
+
+function renderDailyEntry(input: {
+  title: string;
+  body: string;
+  createdIso: string;
+  tags?: string[];
+}): string {
+  const created = input.createdIso;
+  const tags =
+    input.tags && input.tags.length > 0 ? `\n- tags: ${input.tags.join(", ")}` : "";
+  return [
+    `## ${input.title}`,
+    `- created: ${created}${tags}`,
+    "",
+    input.body,
+    "",
+  ].join("\n");
 }

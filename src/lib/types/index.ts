@@ -145,6 +145,21 @@ export interface FileCandidate {
 }
 
 /**
+ * Bounded snippet from a candidate file used for autonomous narrowing without
+ * loading full file bodies.
+ */
+export interface FileCandidatePreview {
+  path: string;
+  title: string;
+  /** Extracted head chars included in context (already bounded). */
+  excerpt: string;
+  /** Number of chars included in {@link excerpt}. */
+  charsRead: number;
+  /** True when file body is longer than the included excerpt. */
+  truncated: boolean;
+}
+
+/**
  * Result of the file-candidate workflow's "search + rank + ask confirmation"
  * phase. Importantly, NO file body has been read at this point — the user
  * must confirm before any actual read happens (`fileCandidateService.readForTask`).
@@ -168,6 +183,18 @@ export interface FileCandidateResult {
   requiresConfirmation: boolean;
   /** Optional rationale from the ranker. Never includes file body content. */
   reason?: string;
+  /**
+   * Present only when the service auto-read a tiny single-hit file under the
+   * configured safety threshold. In this case no extra confirmation is needed.
+   */
+  autoRead?: FileReadResult;
+  /**
+   * Optional bounded multi-file context. Built from top candidates under a
+   * strict total character budget to help autonomous disambiguation.
+   */
+  previews?: FileCandidatePreview[];
+  /** Total chars included across all preview excerpts. */
+  previewTotalChars?: number;
 }
 
 /**

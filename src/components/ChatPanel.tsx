@@ -865,17 +865,19 @@ export function ChatPanel() {
   const webSearchEnabled = current?.webSearchEnabled !== false;
 
   return (
-    <div className="grid h-full min-h-0 grid-cols-1 gap-4 md:grid-cols-[260px,1fr]">
-      <ChatSessionList
-        sessions={sortedSessions}
-        currentId={current?.id ?? null}
-        onSelect={selectSession}
-        onCreate={() => void createSession()}
-        sortMode={sortMode}
-        onSortModeChange={setSortMode}
-        creating={creating}
-        loading={loadingSessions}
-      />
+    <div className="grid h-full min-h-0 grid-cols-1 grid-rows-[minmax(160px,32vh)_minmax(0,1fr)] gap-4 md:grid-cols-[260px,1fr] md:grid-rows-1">
+      <div className="min-h-0">
+        <ChatSessionList
+          sessions={sortedSessions}
+          currentId={current?.id ?? null}
+          onSelect={selectSession}
+          onCreate={() => void createSession()}
+          sortMode={sortMode}
+          onSortModeChange={setSortMode}
+          creating={creating}
+          loading={loadingSessions}
+        />
+      </div>
 
       <div className="flex h-full min-h-0 flex-col rounded-xl border border-bg-border bg-bg-panel">
         <div className="flex items-center justify-between border-b border-bg-border px-4 py-3">

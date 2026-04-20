@@ -260,6 +260,17 @@ function renderCompleteTask(data: unknown): ReactNode {
 
 function renderProposeOpenFile(data: unknown): ReactNode {
   const d = data as FileCandidateResult;
+  if (d.autoRead) {
+    return (
+      <div className="text-sm text-ink">
+        Прочитан файл{" "}
+        <span className="font-medium">&ldquo;{d.autoRead.title}&rdquo;</span>.
+        <div className="mt-1 font-mono text-[11px] text-ink-dim">
+          {d.autoRead.path}
+        </div>
+      </div>
+    );
+  }
   if (!d.candidates || d.candidates.length === 0) {
     return (
       <div className="text-sm text-ink-muted">
@@ -275,6 +286,12 @@ function renderProposeOpenFile(data: unknown): ReactNode {
         <span className="font-mono text-ink-muted">{d.query}</span>. File
         contents were NOT read.
       </div>
+      {d.previews && d.previews.length > 0 ? (
+        <div className="mt-1 text-[11px] text-ink-dim">
+          Автопредпросмотр: {d.previews.length} файл(ов), суммарно{" "}
+          {d.previewTotalChars ?? d.previews.reduce((a, p) => a + p.charsRead, 0)} симв.
+        </div>
+      ) : null}
       <ul className="mt-2 space-y-1">
         {d.candidates.map((c: FileCandidate) => (
           <li
@@ -334,19 +351,16 @@ function renderReadConfirmedFile(data: unknown, ctx: RendererCtx): ReactNode {
   return (
     <>
       <div className="text-sm">
-        Read <span className="font-medium">&ldquo;{d.title}&rdquo;</span>
-        {d.task ? <> for: {d.task}</> : null}.
+        Прочитан файл{" "}
+        <span className="font-medium">&ldquo;{d.title}&rdquo;</span>
+        {d.task ? <> для задачи: {d.task}</> : null}.
         <div className="mt-1 font-mono text-[11px] text-ink-dim">{d.path}</div>
       </div>
       {ctx.confirmed && d.content ? (
         <div className="mt-2 max-h-72 overflow-auto rounded-md border border-bg-border bg-bg p-3 text-sm text-ink">
           <Markdown text={d.content} />
         </div>
-      ) : (
-        <div className="mt-2 text-[11px] text-ink-dim">
-          File body hidden — confirmation required to display.
-        </div>
-      )}
+      ) : null}
     </>
   );
 }

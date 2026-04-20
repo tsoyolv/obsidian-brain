@@ -11,7 +11,7 @@ const ParamsSchema = z.object({
     .string()
     .optional()
     .describe(
-      "Optional vault-relative file to append the task to. Defaults to Tasks/Inbox.md."
+      "Optional vault-relative file to append the task to. Defaults to Tasks/tasks.md."
     ),
 });
 
@@ -22,7 +22,7 @@ export interface CreateTaskOutput {
 
 /**
  * Append `- [ ] <text>` to a tasks file via `taskService.createTask`.
- * Defaults to `Tasks/Inbox.md` when `targetFile` is omitted.
+ * Defaults to `Tasks/tasks.md` when `targetFile` is omitted.
  */
 export const createTaskTool: AgentTool<z.infer<typeof ParamsSchema>, CreateTaskOutput> = {
   name: "create_task",

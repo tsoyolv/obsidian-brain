@@ -36,6 +36,9 @@ export const EnvSchema = z.object({
     .min(1000)
     .max(500000)
     .default(40000),
+  FILE_AUTO_READ_MAX_CHARS: z.coerce.number().int().min(0).max(200000).default(1000),
+  FILE_PREVIEW_TOTAL_CHARS: z.coerce.number().int().min(0).max(200000).default(1500),
+  TASK_ARCHIVE_DONE_THRESHOLD: z.coerce.number().int().min(1).max(10000).default(50),
   TAVILY_API_KEY: z.string().optional(),
 });
 

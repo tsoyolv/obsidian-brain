@@ -60,12 +60,12 @@ folders exist inside your `OBSIDIAN_VAULT_PATH`:
 
 ```
 <vault>/
-├── Inbox/          # Notes saved by the assistant via `save_note`
+├── Notes/          # Saved by `save_note` into daily notes under `Daily/YYYY-MM-DD.md`
 ├── AI Chats/       # Full chat transcripts, one file per session
 │                   # Optional summary + action items live inline in
 │                   # each chat's YAML frontmatter (chat_summary,
 │                   # chat_summary_action_items) — no separate folder.
-└── Tasks/          # Task files (Inbox.md by default; daily / project files allowed)
+└── Tasks/          # Task files (`tasks.md` by default; daily / project files allowed)
 ```
 
 All files use YAML frontmatter where appropriate so they remain searchable in
@@ -106,6 +106,9 @@ Required variables:
 | `MODEL_DYNAMIC_ESCALATION_ENABLED` | Escalates model on failure/complexity signals. |
 | `MODEL_ROUTING_STICKY_TURNS` | How many turns to keep a chosen model.           |
 | `MODEL_ROUTING_HIGH_PROMPT_TOKENS` | Prompt-size threshold for reasoning tier.  |
+| `FILE_AUTO_READ_MAX_CHARS` | Auto-read size limit for single-hit file opens without confirmation (default `1000`). |
+| `FILE_PREVIEW_TOTAL_CHARS` | Total character budget for bounded multi-file previews used during autonomous file selection (default `1500`). |
+| `TASK_ARCHIVE_DONE_THRESHOLD` | Done-task count that triggers auto-archive on `complete_task` (default `50`). |
 | `WEB_SEARCH_PROVIDER`  | Web search provider id (`tavily`).                       |
 | `TAVILY_API_KEY`       | API key for Tavily web search tool.                      |
 | `OPENAI_MODEL_STT`     | Whisper model id (e.g. `whisper-1`).                     |
@@ -301,7 +304,7 @@ can violate them, even by accident:
 2. **Soft delete is the only destructive operation.** The strongest
    mutation `vaultService` exposes is `softDelete(relPath)`, which performs
    an atomic `rename` into `Deleted/<original-relative-path>`. Files leave
-   `Inbox/`, `Tasks/`, etc. and reappear under `Deleted/` with their
+  `Notes/`, `Tasks/`, etc. and reappear under `Deleted/` with their
    folder structure preserved; the disk bytes are never freed by the app.
    `moveFile` cannot land files in `Deleted/` — that path is reserved for
    `softDelete`.
@@ -310,7 +313,7 @@ can violate them, even by accident:
    `ensureNoteExists`, `appendToNote`, `writeRawNote`, `replaceLine`,
    `updateFrontmatter`, `moveFile`, `softDelete`) checks the target's
    top-level segment against `WRITABLE_FOLDERS`:
-   `Inbox`, `AI Chats`, `Tasks`. Writes to the vault
+   `Notes`, `AI Chats`, `Tasks`. Writes to the vault
    root, to `Deleted/`, to `.obsidian/`, or to any other arbitrary
    folder are rejected with a loud error before any I/O happens.
 
