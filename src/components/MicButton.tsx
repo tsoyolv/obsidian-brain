@@ -15,6 +15,9 @@ interface Props {
   variant?: "default" | "primary";
 }
 
+const MAX_RECORDING_SEC = 3 * 60;
+const WARNING_SEC_BEFORE_LIMIT = 20;
+
 /**
  * Microphone capture button using the MediaRecorder API.
  * - First click: starts recording.
@@ -36,6 +39,7 @@ export function MicButton({
   const [recording, setRecording] = useState(false);
   const [supported, setSupported] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const [limitReached, setLimitReached] = useState(false);
   const [elapsedSec, setElapsedSec] = useState(0);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
@@ -60,6 +64,7 @@ export function MicButton({
 
   async function start() {
     setError(null);
+    setLimitReached(false);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
@@ -87,7 +92,14 @@ export function MicButton({
       startedAtRef.current = Date.now();
       setElapsedSec(0);
       timerRef.current = setInterval(() => {
-        setElapsedSec(Math.floor((Date.now() - startedAtRef.current) / 1000));
+        const elapsed = Math.floor((Date.now() - startedAtRef.current) / 1000);
+        if (elapsed >= MAX_RECORDING_SEC) {
+          setElapsedSec(MAX_RECORDING_SEC);
+          setLimitReached(true);
+          stop();
+          return;
+        }
+        setElapsedSec(elapsed);
       }, 250);
       setRecording(true);
     } catch (e) {
@@ -116,6 +128,7 @@ export function MicButton({
   }
 
   const idleClass = variant === "primary" ? "btn-primary" : "btn";
+  const nearLimit = recording && MAX_RECORDING_SEC - elapsedSec <= WARNING_SEC_BEFORE_LIMIT;
 
   return (
     <div className={`flex items-center gap-2 ${className ?? ""}`}>
@@ -129,13 +142,22 @@ export function MicButton({
         {recording ? (
           <>
             <span className="recording-dot inline-block h-2 w-2 rounded-full bg-white" />
-            <span className="tabular-nums">{formatElapsed(elapsedSec)}</span>
+            <span
+              className={`tabular-nums ${nearLimit ? "text-amber-200" : ""}`}
+              title={nearLimit ? "Recording limit is near" : undefined}
+            >
+              {formatElapsed(elapsedSec)}
+            </span>
             <span className="ml-1">Stop</span>
           </>
         ) : (
           <>🎙 {idleLabel}</>
         )}
       </button>
+      <span className="text-xs text-ink-dim">Max: {formatElapsed(MAX_RECORDING_SEC)}</span>
+      {limitReached ? (
+        <span className="text-xs text-amber-300">Stopped at limit</span>
+      ) : null}
       {error ? <span className="text-xs text-red-400">{error}</span> : null}
     </div>
   );
