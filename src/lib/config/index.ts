@@ -2,6 +2,7 @@ import {
   EnvSchema,
   type LLMProviderId,
   type STTProviderId,
+  type WebSearchProviderId,
 } from "./schema";
 
 /**
@@ -13,16 +14,21 @@ import {
  * services that consume this config.
  */
 
-export type { LLMProviderId, STTProviderId };
+export type { LLMProviderId, STTProviderId, WebSearchProviderId };
 
 export interface AppConfig {
   vaultPath: string;
   llmProvider: LLMProviderId;
   sttProvider: STTProviderId;
+  webSearchProvider: WebSearchProviderId;
   openai: {
     apiKey: string | undefined;
     chatModel: string;
+    chatNamingModel: string;
     sttModel: string;
+  };
+  tavily: {
+    apiKey: string | undefined;
   };
 }
 
@@ -35,9 +41,12 @@ export function getConfig(): AppConfig {
     OBSIDIAN_VAULT_PATH: process.env.OBSIDIAN_VAULT_PATH,
     LLM_PROVIDER: process.env.LLM_PROVIDER,
     STT_PROVIDER: process.env.STT_PROVIDER,
+    WEB_SEARCH_PROVIDER: process.env.WEB_SEARCH_PROVIDER,
     OPENAI_API_KEY: process.env.OPENAI_API_KEY,
     OPENAI_MODEL_CHAT: process.env.OPENAI_MODEL_CHAT,
+    OPENAI_MODEL_CHAT_NAMING: process.env.OPENAI_MODEL_CHAT_NAMING,
     OPENAI_MODEL_STT: process.env.OPENAI_MODEL_STT,
+    TAVILY_API_KEY: process.env.TAVILY_API_KEY,
   });
 
   if (!parsed.success) {
@@ -52,10 +61,15 @@ export function getConfig(): AppConfig {
     vaultPath: env.OBSIDIAN_VAULT_PATH,
     llmProvider: env.LLM_PROVIDER,
     sttProvider: env.STT_PROVIDER,
+    webSearchProvider: env.WEB_SEARCH_PROVIDER,
     openai: {
       apiKey: env.OPENAI_API_KEY,
       chatModel: env.OPENAI_MODEL_CHAT,
+      chatNamingModel: env.OPENAI_MODEL_CHAT_NAMING,
       sttModel: env.OPENAI_MODEL_STT,
+    },
+    tavily: {
+      apiKey: env.TAVILY_API_KEY,
     },
   };
   return cached;

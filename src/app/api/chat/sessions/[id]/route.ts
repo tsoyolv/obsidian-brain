@@ -7,6 +7,7 @@ export const dynamic = "force-dynamic";
 
 const PatchSchema = z.object({
   agentEnabled: z.boolean().optional(),
+  webSearchEnabled: z.boolean().optional(),
 });
 
 /**
@@ -31,6 +32,7 @@ export async function GET(
       transcriptPath: session.transcriptPath,
       messages: session.messages,
       agentEnabled: Boolean(session.agentEnabled),
+      webSearchEnabled: session.webSearchEnabled !== false,
       totalTokensUsed: session.totalTokensUsed ?? 0,
       nextPromptEstimateTokens: chat.estimateNextPromptTokens(session),
       tokenLimit: CHAT_TOKEN_LIMIT,
@@ -61,6 +63,9 @@ export async function PATCH(
     if (patch.agentEnabled !== undefined) {
       session = await chat.setAgentEnabled(id, patch.agentEnabled);
     }
+    if (patch.webSearchEnabled !== undefined) {
+      session = await chat.setWebSearchEnabled(id, patch.webSearchEnabled);
+    }
     return ok({
       id: session.id,
       title: session.title,
@@ -69,6 +74,7 @@ export async function PATCH(
       transcriptPath: session.transcriptPath,
       messages: session.messages,
       agentEnabled: Boolean(session.agentEnabled),
+      webSearchEnabled: session.webSearchEnabled !== false,
       totalTokensUsed: session.totalTokensUsed ?? 0,
       nextPromptEstimateTokens: chat.estimateNextPromptTokens(session),
       tokenLimit: CHAT_TOKEN_LIMIT,

@@ -9,6 +9,7 @@ import { readConfirmedFileTool } from "./read_confirmed_file";
 import { runFileTaskTool } from "./run_file_task";
 import { answerFromVaultTool } from "./answer_from_vault";
 import { softDeleteTool } from "./soft_delete";
+import { webSearchTool } from "./web_search";
 
 /**
  * The tool registry. Single source of truth the orchestrator (and any
@@ -30,6 +31,7 @@ const allTools: AnyAgentTool[] = [
   runFileTaskTool,
   answerFromVaultTool,
   softDeleteTool,
+  webSearchTool,
 ];
 
 export const toolRegistry: Map<string, AnyAgentTool> = new Map(
@@ -55,4 +57,5 @@ export {
   runFileTaskTool,
   answerFromVaultTool,
   softDeleteTool,
+  webSearchTool,
 };

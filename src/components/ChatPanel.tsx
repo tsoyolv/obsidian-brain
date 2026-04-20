@@ -2,7 +2,11 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { ChatSessionList, type SessionSummary } from "./ChatSessionList";
+import {
+  ChatSessionList,
+  type SessionSortMode,
+  type SessionSummary,
+} from "./ChatSessionList";
 import { MessageBubble } from "./MessageBubble";
 import { MicButton } from "./MicButton";
 import { ErrorBanner, SkeletonLines, Spinner, ThinkingDots } from "./Spinner";
@@ -27,6 +31,7 @@ interface SessionFull {
   transcriptPath?: string;
   messages: ChatMessage[];
   agentEnabled?: boolean;
+  webSearchEnabled?: boolean;
   totalTokensUsed?: number;
   nextPromptEstimateTokens?: number;
   chatSummary?: ChatSummary;
@@ -68,6 +73,7 @@ interface ActiveAgentTurn {
 
 export function ChatPanel() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [sortMode, setSortMode] = useState<SessionSortMode>("updated_desc");
   const [current, setCurrent] = useState<SessionFull | null>(null);
   const [creating, setCreating] = useState(false);
   const [draft, setDraft] = useState("");
@@ -82,6 +88,7 @@ export function ChatPanel() {
   const [loadingSessions, setLoadingSessions] = useState(true);
   const [transcribing, setTranscribing] = useState(false);
   const [togglingAgent, setTogglingAgent] = useState(false);
+  const [togglingWebSearch, setTogglingWebSearch] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   // Points at the ChatSummaryCard when one is rendered. We scroll here
   // after a fresh Summarize so the user actually sees the card appear
@@ -114,6 +121,35 @@ export function ChatPanel() {
     refreshSessions();
   }, [refreshSessions]);
 
+  useEffect(() => {
+    if (!current) return;
+    const fresh = sessions.find((s) => s.id === current.id);
+    if (!fresh) return;
+    if (
+      fresh.title === current.title &&
+      fresh.updatedAt === current.updatedAt &&
+      fresh.totalTokensUsed === current.totalTokensUsed &&
+      fresh.nextPromptEstimateTokens === current.nextPromptEstimateTokens &&
+      Boolean(fresh.agentEnabled) === Boolean(current.agentEnabled) &&
+      Boolean(fresh.webSearchEnabled) === Boolean(current.webSearchEnabled)
+    ) {
+      return;
+    }
+    setCurrent((prev) =>
+      prev && prev.id === fresh.id
+        ? {
+            ...prev,
+            title: fresh.title,
+            updatedAt: fresh.updatedAt,
+            agentEnabled: fresh.agentEnabled,
+            webSearchEnabled: fresh.webSearchEnabled,
+            totalTokensUsed: fresh.totalTokensUsed,
+            nextPromptEstimateTokens: fresh.nextPromptEstimateTokens,
+          }
+        : prev
+    );
+  }, [sessions, current]);
+
   // Auto-open the most recent chat once the session list first arrives.
   // Sessions come pre-sorted by `updatedAt DESC` from the server, so
   // `sessions[0]` is the freshest one. Runs at most once (`autoOpenedRef`)
@@ -123,8 +159,12 @@ export function ChatPanel() {
     if (loadingSessions) return;
     if (current) return;
     if (sessions.length === 0) return;
+    const freshest = [...sessions].sort((a, b) =>
+      b.updatedAt.localeCompare(a.updatedAt)
+    )[0];
+    if (!freshest) return;
     autoOpenedRef.current = true;
-    void selectSession(sessions[0]!.id);
+    void selectSession(freshest.id);
     // selectSession is stable enough for our purposes; we deliberately
     // don't include it to avoid re-running on every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -176,10 +216,11 @@ export function ChatPanel() {
     setCurrent({
       id: found.id,
       title: found.title,
-      createdAt: found.updatedAt,
+      createdAt: found.createdAt,
       updatedAt: found.updatedAt,
       messages: [],
       agentEnabled: found.agentEnabled,
+      webSearchEnabled: found.webSearchEnabled,
       totalTokensUsed: found.totalTokensUsed,
       nextPromptEstimateTokens: found.nextPromptEstimateTokens,
     });
@@ -254,6 +295,45 @@ export function ChatPanel() {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setTogglingAgent(false);
+    }
+  }
+
+  /**
+   * PATCH the session's `webSearchEnabled` flag. Independent from `agent`:
+   * users can keep vault tools on while disabling external web lookups.
+   */
+  async function toggleWebSearch(next: boolean) {
+    if (!current || togglingWebSearch || streaming) return;
+    setTogglingWebSearch(true);
+    setError(null);
+    const previous = current.webSearchEnabled ?? true;
+    setCurrent((prev) => (prev ? { ...prev, webSearchEnabled: next } : prev));
+    setSessions((prev) =>
+      prev.map((s) => (s.id === current.id ? { ...s, webSearchEnabled: next } : s))
+    );
+    try {
+      const res = await fetch(
+        `/api/chat/sessions/${encodeURIComponent(current.id)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ webSearchEnabled: next }),
+        }
+      );
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error?.message ?? "Failed");
+    } catch (e) {
+      setCurrent((prev) =>
+        prev ? { ...prev, webSearchEnabled: previous } : prev
+      );
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === current.id ? { ...s, webSearchEnabled: previous } : s
+        )
+      );
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTogglingWebSearch(false);
     }
   }
 
@@ -754,6 +834,10 @@ export function ChatPanel() {
   }
 
   const messageList = useMemo(() => current?.messages ?? [], [current]);
+  const sortedSessions = useMemo(
+    () => sortSessions(sessions, sortMode),
+    [sessions, sortMode]
+  );
 
   const sessionTokensUsed = current?.totalTokensUsed ?? 0;
   const contextNow = current?.nextPromptEstimateTokens ?? 0;
@@ -770,14 +854,17 @@ export function ChatPanel() {
     lastPrompt > 0 ? Math.round((lastCached / lastPrompt) * 100) : 0;
 
   const agentEnabled = Boolean(current?.agentEnabled);
+  const webSearchEnabled = current?.webSearchEnabled !== false;
 
   return (
     <div className="grid h-[calc(100vh-9rem)] grid-cols-1 gap-4 md:grid-cols-[260px,1fr]">
       <ChatSessionList
-        sessions={sessions}
+        sessions={sortedSessions}
         currentId={current?.id ?? null}
         onSelect={selectSession}
         onCreate={() => void createSession()}
+        sortMode={sortMode}
+        onSortModeChange={setSortMode}
         creating={creating}
         loading={loadingSessions}
       />
@@ -789,14 +876,6 @@ export function ChatPanel() {
               <div className="truncate text-sm font-semibold">
                 {current?.title ?? "Discussion"}
               </div>
-              {current && agentEnabled ? (
-                <span
-                  className="pill border-sky-500/40 text-sky-200"
-                  title="Agent tools enabled — replies may invoke vault tools"
-                >
-                  agent
-                </span>
-              ) : null}
             </div>
             {current?.transcriptPath ? (
               <div className="truncate font-mono text-[11px] text-ink-dim">
@@ -812,7 +891,7 @@ export function ChatPanel() {
             {current ? (
               <label
                 className="flex cursor-pointer items-center gap-1 text-[11px] text-ink-dim"
-                title="When on, the assistant can call vault tools (search, save, etc.) inside this chat"
+                title="When on, the assistant can call Obsidian Vault tools in this chat"
               >
                 <input
                   type="checkbox"
@@ -821,7 +900,22 @@ export function ChatPanel() {
                   disabled={togglingAgent || streaming}
                   onChange={(e) => void toggleAgent(e.target.checked)}
                 />
-                <span>agent</span>
+                <span>Obsidian Vault</span>
+              </label>
+            ) : null}
+            {current ? (
+              <label
+                className="flex cursor-pointer items-center gap-1 text-[11px] text-ink-dim"
+                title="When on, the assistant may use external web search"
+              >
+                <input
+                  type="checkbox"
+                  className="h-3 w-3 accent-violet-500"
+                  checked={webSearchEnabled}
+                  disabled={togglingWebSearch || streaming}
+                  onChange={(e) => void toggleWebSearch(e.target.checked)}
+                />
+                <span>Web search</span>
               </label>
             ) : null}
             {current ? (
@@ -1038,6 +1132,22 @@ export function ChatPanel() {
       </div>
     </div>
   );
+}
+
+function sortSessions(
+  sessions: SessionSummary[],
+  mode: SessionSortMode
+): SessionSummary[] {
+  const out = [...sessions];
+  out.sort((a, b) => {
+    if (mode === "updated_desc") return b.updatedAt.localeCompare(a.updatedAt);
+    if (mode === "updated_asc") return a.updatedAt.localeCompare(b.updatedAt);
+    if (mode === "created_desc") return b.createdAt.localeCompare(a.createdAt);
+    if (mode === "created_asc") return a.createdAt.localeCompare(b.createdAt);
+    if (mode === "title_asc") return a.title.localeCompare(b.title);
+    return b.title.localeCompare(a.title);
+  });
+  return out;
 }
 
 /**

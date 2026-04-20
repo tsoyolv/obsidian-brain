@@ -9,6 +9,7 @@ const CreateSchema = z.object({
   title: z.string().optional(),
   systemPrompt: z.string().optional(),
   agentEnabled: z.boolean().optional(),
+  webSearchEnabled: z.boolean().optional(),
 });
 
 export async function GET() {
@@ -23,6 +24,7 @@ export async function GET() {
       messageCount: s.messages.length,
       transcriptPath: s.transcriptPath,
       agentEnabled: Boolean(s.agentEnabled),
+      webSearchEnabled: s.webSearchEnabled !== false,
       totalTokensUsed: s.totalTokensUsed ?? 0,
       nextPromptEstimateTokens: chat.estimateNextPromptTokens(s),
     }));
@@ -51,6 +53,7 @@ export async function POST(req: Request) {
       transcriptPath: session.transcriptPath,
       messages: session.messages,
       agentEnabled: Boolean(session.agentEnabled),
+      webSearchEnabled: session.webSearchEnabled !== false,
       totalTokensUsed: session.totalTokensUsed ?? 0,
       nextPromptEstimateTokens: chat.estimateNextPromptTokens(session),
       tokenLimit: CHAT_TOKEN_LIMIT,

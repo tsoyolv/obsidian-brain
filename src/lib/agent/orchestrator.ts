@@ -64,6 +64,9 @@ const SYSTEM_PROMPT = [
   "You may chain MULTIPLE tool calls in one turn (e.g. find_file →",
   "propose_open_file). When you have everything you need, stop calling tools",
   "and reply to the user in plain text with a short, helpful summary.",
+  "",
+  "When the user asks about current events, external services, or public web",
+  "content, use `web_search` first. Cite source URLs in your final answer.",
 ].join("\n");
 
 // ---- Public event shape ----
@@ -129,6 +132,12 @@ export interface PriorContext {
    * to teach the orchestrator about ChatSession internals.
    */
   systemSuffix?: string;
+  /**
+   * Optional allowlist of tool names for this run. When provided, the model
+   * only sees these tools and any out-of-allowlist tool call is treated as
+   * unavailable.
+   */
+  allowedTools?: string[];
 }
 
 export interface RunTurnInput {
@@ -189,6 +198,7 @@ export async function* runTurn(
     sessions.replaceMessages(session.id, input.priorContext.history);
   }
   const systemSuffix = input.priorContext?.systemSuffix;
+  const allowedTools = input.priorContext?.allowedTools;
 
   // (1) Drop pending if it has expired or already had its grace turn. We
   // do this BEFORE matching so a stale yes/no can't accidentally trigger
@@ -202,7 +212,7 @@ export async function* runTurn(
     const intent = parseUserIntent(userText, pendingAtStart.candidates);
     if (intent.kind !== "none") {
       sessions.appendMessage(session.id, { role: "user", content: userText });
-      yield* resolveFromPending(session.id, pendingAtStart, intent);
+      yield* resolveFromPending(session.id, pendingAtStart, intent, allowedTools);
       return;
     }
   }
@@ -216,7 +226,7 @@ export async function* runTurn(
     hasPending: Boolean(pendingAtStart),
   });
 
-  yield* iterativeLoop(session.id, pendingAtStart, systemSuffix);
+  yield* iterativeLoop(session.id, pendingAtStart, systemSuffix, allowedTools);
 
   // (4) If the pending we entered with is STILL there at end-of-turn, it
   // got injected as context but was neither matched nor consumed. Mark it
@@ -267,6 +277,7 @@ export async function* confirmTurn(
     sessions.replaceMessages(session.id, input.priorContext.history);
   }
   const systemSuffix = input.priorContext?.systemSuffix;
+  const allowedTools = input.priorContext?.allowedTools;
   const pending = session.pendingConfirmation;
 
   if (!pending || pending.token !== input.token) {
@@ -282,7 +293,7 @@ export async function* confirmTurn(
     return;
   }
 
-  const tool = getTool(pending.toolName);
+  const tool = getAllowedTool(pending.toolName, allowedTools);
   if (!tool) {
     sessions.setPendingConfirmation(session.id, undefined);
     log.warn("confirmTurn: pending tool unknown", { name: pending.toolName });
@@ -304,7 +315,7 @@ export async function* confirmTurn(
   // be retried.
   const argsWithToken = injectConfirmationToken(pending.args, pending.token);
   yield* runToolAndYield(session.id, tool, argsWithToken);
-  yield* iterativeLoop(session.id, undefined, systemSuffix);
+  yield* iterativeLoop(session.id, undefined, systemSuffix, allowedTools);
 
   t.done("confirmTurn", {
     sessionId: session.id,
@@ -346,11 +357,14 @@ export function estimateAgentNextPromptTokens(
 async function* iterativeLoop(
   sessionId: string,
   pendingContext?: PendingConfirmation,
-  systemSuffix?: string
+  systemSuffix?: string,
+  allowedTools?: string[]
 ): AsyncGenerator<AgentEvent, void, void> {
   const sessions = getAgentSessionStore();
   const llm = llmProviderFactory.get();
-  const tools = listTools();
+  const tools = listTools().filter(
+    (t) => !allowedTools || allowedTools.includes(t.name)
+  );
   const descriptors: ToolDescriptor[] = tools.map((t) => toDescriptor(t));
 
   let toolCallsUsed = countToolCallsInSession(
@@ -402,7 +416,7 @@ async function* iterativeLoop(
     // Path B — tool dispatch.
     toolCallsUsed += 1;
 
-    const tool = getTool(toolCall.name);
+    const tool = getAllowedTool(toolCall.name, allowedTools);
     if (!tool) {
       const callId = newId("call");
       sessions.appendMessage(sessionId, {
@@ -558,7 +572,8 @@ type UserIntent =
 async function* resolveFromPending(
   sessionId: string,
   pending: PendingConfirmation,
-  intent: UserIntent
+  intent: UserIntent,
+  allowedTools?: string[]
 ): AsyncGenerator<AgentEvent, void, void> {
   const sessions = getAgentSessionStore();
 
@@ -578,7 +593,7 @@ async function* resolveFromPending(
   if (intent.kind !== "affirmative") return;
 
   // Affirmative — possibly with an ordinal selector.
-  const tool = getTool(pending.toolName);
+  const tool = getAllowedTool(pending.toolName, allowedTools);
   if (!tool) {
     sessions.setPendingConfirmation(sessionId, undefined);
     log.warn("resolveFromPending: tool gone", { name: pending.toolName });
@@ -626,7 +641,7 @@ async function* resolveFromPending(
 
   const argsWithToken = injectConfirmationToken(args, pending.token);
   yield* runToolAndYield(sessionId, tool, argsWithToken);
-  yield* iterativeLoop(sessionId);
+  yield* iterativeLoop(sessionId, undefined, undefined, allowedTools);
 }
 
 /**
@@ -921,6 +936,14 @@ function toDescriptor(tool: AnyAgentTool): ToolDescriptor {
     description: tool.description,
     parameters: zodToJsonSchema(tool.parameters),
   };
+}
+
+function getAllowedTool(
+  name: string,
+  allowedTools?: string[]
+): AnyAgentTool | undefined {
+  if (allowedTools && !allowedTools.includes(name)) return undefined;
+  return getTool(name);
 }
 
 /**

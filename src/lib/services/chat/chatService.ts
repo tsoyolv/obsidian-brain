@@ -1,5 +1,6 @@
 import { llmProviderFactory } from "@/lib/providers/llm";
 import type { ChatUsage, LLMMessage } from "@/lib/providers/llm/types";
+import { getConfig } from "@/lib/config";
 import { confirmTurn, runTurn } from "@/lib/agent/orchestrator";
 import type { AgentEvent } from "@/lib/agent/orchestrator";
 import { getAgentSessionStore } from "@/lib/agent/session";
@@ -24,6 +25,7 @@ import {
 } from "./transcripts";
 
 const log = createLogger("chatService");
+const cfg = getConfig();
 
 const DEFAULT_SYSTEM_PROMPT =
   "You are a helpful assistant integrated with the user's Obsidian vault. " +
@@ -62,6 +64,11 @@ const ROLLING_SUMMARY_SYSTEM_PROMPT =
   "commentary. Do not invent anything that isn't in the prior summary or " +
   "the new turns.";
 
+const CHAT_TITLE_SYSTEM_PROMPT =
+  "Generate a short chat title from the first user message. " +
+  "Output only the title text. Keep it in the same language as the user " +
+  "message. 3-8 words. No quotes, no emoji, no trailing punctuation.";
+
 export interface CreateSessionInput {
   title?: string;
   systemPrompt?: string;
@@ -72,6 +79,8 @@ export interface CreateSessionInput {
    * are not disrupted.
    */
   agentEnabled?: boolean;
+  /** Enables external web search tools for this session (default true). */
+  webSearchEnabled?: boolean;
 }
 
 export interface AppendMessageInput {
@@ -159,6 +168,11 @@ export interface ChatService {
    * session.
    */
   setAgentEnabled(sessionId: string, enabled: boolean): Promise<ChatSession>;
+  /**
+   * Toggle external web-search tool availability for the session.
+   * Independent from `agentEnabled`; when false, agent keeps vault tools.
+   */
+  setWebSearchEnabled(sessionId: string, enabled: boolean): Promise<ChatSession>;
   /**
    * Heuristic estimate of the prompt size that would be sent on the next
    * turn for this session (system + rolling summary + pinned + raw tail).
@@ -350,6 +364,10 @@ class ChatServiceImpl implements ChatService {
 
     const agentEnabled =
       typeof data.agent_enabled === "boolean" ? data.agent_enabled : undefined;
+    const webSearchEnabled =
+      typeof data.web_search_enabled === "boolean"
+        ? data.web_search_enabled
+        : undefined;
 
     const chatSummary = parseChatSummaryFrontmatter(data);
 
@@ -361,6 +379,7 @@ class ChatServiceImpl implements ChatService {
       messages,
       transcriptPath: relPath,
       agentEnabled,
+      webSearchEnabled,
       summary,
       summaryUpTo,
       totalTokensUsed,
@@ -527,6 +546,9 @@ class ChatServiceImpl implements ChatService {
     if (session.agentEnabled !== undefined) {
       patch.agent_enabled = session.agentEnabled;
     }
+    if (session.webSearchEnabled !== undefined) {
+      patch.web_search_enabled = session.webSearchEnabled;
+    }
     if (session.chatSummary) {
       // User-requested chat summary lives in this chat's OWN transcript
       // frontmatter — we deliberately don't spill it to `AI Summaries/`
@@ -560,6 +582,7 @@ class ChatServiceImpl implements ChatService {
     // `agentEnabled: false` explicitly to opt out (and existing chats
     // keep whatever value is in their transcript frontmatter).
     const agentEnabled = input?.agentEnabled === false ? false : true;
+    const webSearchEnabled = input?.webSearchEnabled === false ? false : true;
 
     const session: ChatSession = {
       id,
@@ -568,6 +591,7 @@ class ChatServiceImpl implements ChatService {
       updatedAt: now,
       messages: [],
       agentEnabled,
+      webSearchEnabled,
     };
 
     const stamp = compactLocalStamp();
@@ -585,6 +609,7 @@ class ChatServiceImpl implements ChatService {
         provider: llm.id,
         model: llm.defaultModel,
         agent_enabled: agentEnabled,
+        web_search_enabled: webSearchEnabled,
       },
       uniqueOnConflict: true,
     });
@@ -618,6 +643,20 @@ class ChatServiceImpl implements ChatService {
     session.updatedAt = nowIso();
     await this.persistSessionState(session);
     log.info("setAgentEnabled", { sessionId, enabled });
+    return session;
+  }
+
+  async setWebSearchEnabled(
+    sessionId: string,
+    enabled: boolean
+  ): Promise<ChatSession> {
+    let session = this.store.get(sessionId);
+    if (!session) session = await this.hydrateSessionById(sessionId);
+    if (!session) throw new Error(`Unknown chat session: ${sessionId}`);
+    session.webSearchEnabled = enabled;
+    session.updatedAt = nowIso();
+    await this.persistSessionState(session);
+    log.info("setWebSearchEnabled", { sessionId, enabled });
     return session;
   }
 
@@ -661,6 +700,7 @@ class ChatServiceImpl implements ChatService {
         renderChatMessageMarkdown(userMessage)
       );
     }
+    await this.maybeAutoRenameFromFirstUserTurn(session, userMessage.content);
 
     const systemPrompt =
       this.store.getSystemPrompt(session.id) ?? DEFAULT_SYSTEM_PROMPT;
@@ -677,6 +717,100 @@ class ChatServiceImpl implements ChatService {
     }
 
     yield* this.streamPlainTurn(session, systemPrompt, tTurn);
+  }
+
+  /**
+   * Auto-title chats after the first user turn, similar to chat apps:
+   * create with timestamp title, then replace it with an LLM-generated
+   * semantic title once we have real user intent.
+   */
+  private async maybeAutoRenameFromFirstUserTurn(
+    session: ChatSession,
+    firstUserContent: string
+  ): Promise<void> {
+    if (session.messages.length !== 1) return;
+    if (!isTimestampStyleTitle(session.title)) return;
+    const source = firstUserContent.trim();
+    if (!source) return;
+
+    const llm = llmProviderFactory.get();
+    let nextTitle = "";
+    try {
+      const res = await llm.sendMessage({
+        model: cfg.openai.chatNamingModel,
+        temperature: 0.1,
+        maxOutputTokens: 24,
+        messages: [
+          { role: "system", content: CHAT_TITLE_SYSTEM_PROMPT },
+          { role: "user", content: source },
+        ],
+      });
+      nextTitle = sanitizeGeneratedTitle(res.content);
+    } catch (err) {
+      log.warn("autoRename: title generation failed", {
+        sessionId: session.id,
+        err: String(err),
+      });
+      return;
+    }
+    if (!nextTitle || nextTitle === session.title) return;
+
+    const prevTitle = session.title;
+    session.title = nextTitle;
+    session.updatedAt = nowIso();
+
+    if (session.transcriptPath) {
+      try {
+        await this.vault.updateFrontmatter(session.transcriptPath, {
+          title: nextTitle,
+          updated: session.updatedAt,
+        });
+      } catch (err) {
+        log.warn("autoRename: frontmatter title update failed", {
+          sessionId: session.id,
+          err: String(err),
+        });
+      }
+      await this.maybeRenameTranscriptFile(session, nextTitle);
+    }
+    log.info("autoRename", {
+      sessionId: session.id,
+      from: prevTitle,
+      to: nextTitle,
+    });
+  }
+
+  /**
+   * Keep transcript filenames human-friendly after auto titling while
+   * preserving the original leading timestamp prefix.
+   */
+  private async maybeRenameTranscriptFile(
+    session: ChatSession,
+    title: string
+  ): Promise<void> {
+    const rel = session.transcriptPath;
+    if (!rel) return;
+    const parts = rel.split("/");
+    const oldName = parts.pop();
+    if (!oldName) return;
+    const oldStem = stripMdExt(oldName);
+    const m = /^(\d{8}-\d{6})\s+/.exec(oldStem);
+    if (!m) return;
+    const nextName = ensureMarkdownExt(`${m[1]} ${title}`);
+    if (nextName === oldName) return;
+    const parent = parts.join("/");
+    const dest = parent ? `${parent}/${nextName}` : nextName;
+    try {
+      const moved = await this.vault.moveFile(rel, dest, { uniqueOnConflict: true });
+      session.transcriptPath = moved.path;
+    } catch (err) {
+      log.warn("autoRename: transcript rename failed", {
+        sessionId: session.id,
+        from: rel,
+        to: dest,
+        err: String(err),
+      });
+    }
   }
 
   /**
@@ -802,6 +936,7 @@ class ChatServiceImpl implements ChatService {
     const tailWithoutUser = session.messages.slice(0, -1);
     const priorHistory = chatHistoryToAgentMessages(tailWithoutUser);
     const systemSuffix = this.buildAgentSystemSuffix(session, systemPrompt);
+    const allowedTools = this.buildAgentAllowedTools(session);
 
     const assistantId = newId("msg");
     let assistantBuffer = "";
@@ -811,7 +946,7 @@ class ChatServiceImpl implements ChatService {
       for await (const ev of runTurn({
         sessionId: session.id,
         userText: userMessage.content,
-        priorContext: { history: priorHistory, systemSuffix },
+        priorContext: { history: priorHistory, systemSuffix, allowedTools },
       })) {
         yielded = true;
         await this.handleAgentEvent(session, ev);
@@ -911,6 +1046,7 @@ class ChatServiceImpl implements ChatService {
       this.store.getSystemPrompt(session.id) ?? DEFAULT_SYSTEM_PROMPT;
     const priorHistory = chatHistoryToAgentMessages(session.messages);
     const systemSuffix = this.buildAgentSystemSuffix(session, systemPrompt);
+    const allowedTools = this.buildAgentAllowedTools(session);
 
     const assistantId = newId("msg");
     let assistantBuffer = "";
@@ -920,7 +1056,7 @@ class ChatServiceImpl implements ChatService {
       for await (const ev of confirmTurn({
         sessionId: session.id,
         token: input.token,
-        priorContext: { history: priorHistory, systemSuffix },
+        priorContext: { history: priorHistory, systemSuffix, allowedTools },
       })) {
         await this.handleAgentEvent(session, ev);
         if (ev.type === "message_delta") {
@@ -1102,6 +1238,30 @@ class ChatServiceImpl implements ChatService {
     return parts.join("\n\n");
   }
 
+  /**
+   * Per-session tool allowlist for agent turns.
+   * Keep vault tools available when agent is enabled, while letting the user
+   * independently disable external web search.
+   */
+  private buildAgentAllowedTools(session: ChatSession): string[] | undefined {
+    const out = [
+      "save_note",
+      "create_task",
+      "complete_task",
+      "search_vault",
+      "find_file",
+      "propose_open_file",
+      "read_confirmed_file",
+      "run_file_task",
+      "answer_from_vault",
+      "soft_delete",
+    ];
+    if (session.webSearchEnabled !== false) {
+      out.push("web_search");
+    }
+    return out;
+  }
+
   async summarize(sessionId: string): Promise<SummaryResult> {
     await this.ensureReady();
     let session = this.store.get(sessionId);
@@ -1222,6 +1382,22 @@ function stringifyCompact(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function isTimestampStyleTitle(title: string): boolean {
+  return /^Chat \d{8}-\d{6}$/.test(title.trim());
+}
+
+function sanitizeGeneratedTitle(raw: string): string {
+  const firstLine = raw.split(/\r?\n/, 1)[0] ?? "";
+  const cleaned = firstLine
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/[\\/:*?"<>|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[.!?;,:\-\s]+$/g, "");
+  if (!cleaned) return "";
+  return cleaned.slice(0, 80).trim();
 }
 
 /**

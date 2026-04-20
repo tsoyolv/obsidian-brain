@@ -98,6 +98,8 @@ Required variables:
 | `STT_PROVIDER`         | `openai` (only provider in MVP).                         |
 | `OPENAI_API_KEY`       | Your OpenAI API key.                                     |
 | `OPENAI_MODEL_CHAT`    | Chat/completions model (e.g. `gpt-4o-mini`).             |
+| `WEB_SEARCH_PROVIDER`  | Web search provider id (`tavily`).                       |
+| `TAVILY_API_KEY`       | API key for Tavily web search tool.                      |
 | `OPENAI_MODEL_STT`     | Whisper model id (e.g. `whisper-1`).                     |
 
 ### 3. Run the dev server
@@ -130,6 +132,7 @@ Type or record. Examples that exercise the agent's tools:
 - `what did I write about Postgres replication?`
 - `find file shopping list`
 - `open my reading list and add Dune`
+- `check Timeweb status right now and share sources`
 
 For voice, click **To text** to put the transcript into the input box for
 editing, or **Send** to record → transcribe → submit in one step.

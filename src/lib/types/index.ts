@@ -55,6 +55,12 @@ export interface ChatSession {
    */
   agentEnabled?: boolean;
   /**
+   * When true, the agent may use external web search tools (if configured).
+   * Kept separate from `agentEnabled` so users can allow vault actions while
+   * disabling internet lookups for this chat.
+   */
+  webSearchEnabled?: boolean;
+  /**
    * Rolling plain-prose summary of the head of the conversation. Injected as
    * a system message at the top of the next prompt so the model sees the
    * gist of everything older than {@link summaryUpTo} without paying the

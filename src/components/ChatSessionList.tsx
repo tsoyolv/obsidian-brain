@@ -5,18 +5,30 @@ import { SkeletonLines, Spinner } from "./Spinner";
 export interface SessionSummary {
   id: string;
   title: string;
+  createdAt: string;
   updatedAt: string;
   messageCount: number;
   agentEnabled?: boolean;
+  webSearchEnabled?: boolean;
   totalTokensUsed?: number;
   nextPromptEstimateTokens?: number;
 }
+
+export type SessionSortMode =
+  | "updated_desc"
+  | "updated_asc"
+  | "created_desc"
+  | "created_asc"
+  | "title_asc"
+  | "title_desc";
 
 interface Props {
   sessions: SessionSummary[];
   currentId: string | null;
   onSelect: (id: string) => void;
   onCreate: () => void;
+  sortMode: SessionSortMode;
+  onSortModeChange: (mode: SessionSortMode) => void;
   creating?: boolean;
   loading?: boolean;
 }
@@ -26,6 +38,8 @@ export function ChatSessionList({
   currentId,
   onSelect,
   onCreate,
+  sortMode,
+  onSortModeChange,
   creating,
   loading,
 }: Props) {
@@ -46,6 +60,21 @@ export function ChatSessionList({
           "+ New chat"
         )}
       </button>
+      <label className="flex items-center gap-2 px-1 text-xs text-ink-dim">
+        <span>Sort</span>
+        <select
+          value={sortMode}
+          onChange={(e) => onSortModeChange(e.target.value as SessionSortMode)}
+          className="min-w-0 flex-1 rounded-md border border-bg-border bg-bg-panel px-2 py-1 text-xs text-ink"
+        >
+          <option value="updated_desc">Updated: newest first</option>
+          <option value="updated_asc">Updated: oldest first</option>
+          <option value="created_desc">Created: newest first</option>
+          <option value="created_asc">Created: oldest first</option>
+          <option value="title_asc">Title: A-Z</option>
+          <option value="title_desc">Title: Z-A</option>
+        </select>
+      </label>
       <div className="flex-1 overflow-y-auto rounded-xl border border-bg-border bg-bg-panel">
         {loading && sessions.length === 0 ? (
           <div className="space-y-3 p-3">
