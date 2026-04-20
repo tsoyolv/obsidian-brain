@@ -38,10 +38,12 @@ export class OpenAIChatProvider implements LLMProvider {
 
   async sendMessage(input: ChatInput): Promise<ChatResponse> {
     const model = input.model ?? this.defaultModel;
+    const temperature = normalizeTemperatureForModel(model, input.temperature);
+    const startedAt = Date.now();
     const completion = await this.client.chat.completions.create({
       model,
       messages: input.messages.map((m) => ({ role: m.role, content: m.content })),
-      temperature: input.temperature,
+      temperature,
       max_tokens: input.maxOutputTokens,
       response_format:
         input.responseFormat === "json_object"
@@ -50,6 +52,20 @@ export class OpenAIChatProvider implements LLMProvider {
     });
 
     const content = completion.choices[0]?.message?.content ?? "";
+    const elapsedMs = Date.now() - startedAt;
+    log.info("sendMessage", {
+      model,
+      messages: input.messages.length,
+      responseFormat: input.responseFormat ?? "text",
+      elapsedMs,
+      usage: completion.usage
+        ? {
+            promptTokens: completion.usage.prompt_tokens,
+            completionTokens: completion.usage.completion_tokens,
+            totalTokens: completion.usage.total_tokens,
+          }
+        : undefined,
+    });
     return {
       content,
       model,
@@ -65,22 +81,24 @@ export class OpenAIChatProvider implements LLMProvider {
 
   async *streamMessage(input: ChatInput): AsyncIterable<StreamDelta> {
     const model = input.model ?? this.defaultModel;
+    const temperature = normalizeTemperatureForModel(model, input.temperature);
     const debug = process.env.DEBUG_STREAM === "1";
+    const startedAt = Date.now();
     // `include_usage` tells OpenAI to emit one extra final chunk with
     // prompt_tokens / completion_tokens populated. Without it, streamed
     // responses carry no usage at all and we'd need a separate estimator.
     const stream = await this.client.chat.completions.create({
       model,
       messages: input.messages.map((m) => ({ role: m.role, content: m.content })),
-      temperature: input.temperature,
+      temperature,
       max_tokens: input.maxOutputTokens,
       stream: true,
       stream_options: { include_usage: true },
     });
 
     let chunkIndex = 0;
-    const startedAt = Date.now();
     let finalUsage: StreamDelta["usage"];
+    let firstDeltaAt: number | undefined;
     for await (const part of stream) {
       const delta = part.choices[0]?.delta?.content;
       if (part.usage) {
@@ -100,6 +118,7 @@ export class OpenAIChatProvider implements LLMProvider {
         };
       }
       if (delta) {
+        if (firstDeltaAt === undefined) firstDeltaAt = Date.now();
         if (debug) {
           const dt = Date.now() - startedAt;
           log.debug(
@@ -114,6 +133,15 @@ export class OpenAIChatProvider implements LLMProvider {
     // delivered it). Deltas are empty so consumers that only append
     // `delta` to a buffer won't be disturbed.
     yield { delta: "", usage: finalUsage };
+    log.info("streamMessage", {
+      model,
+      messages: input.messages.length,
+      chunks: chunkIndex,
+      timeToFirstDeltaMs:
+        firstDeltaAt !== undefined ? firstDeltaAt - startedAt : null,
+      elapsedMs: Date.now() - startedAt,
+      usage: finalUsage,
+    });
     if (debug) {
       log.debug(
         `stream done: ${chunkIndex} chunks in ${Date.now() - startedAt}ms`,
@@ -129,6 +157,8 @@ export class OpenAIChatProvider implements LLMProvider {
     tools: ToolDescriptor[]
   ): AsyncIterable<ToolChatFrame> {
     const model = input.model ?? this.defaultModel;
+    const temperature = normalizeTemperatureForModel(model, input.temperature);
+    const startedAt = Date.now();
     const oaiTools = tools.map((t) => ({
       type: "function" as const,
       function: {
@@ -144,7 +174,7 @@ export class OpenAIChatProvider implements LLMProvider {
         role: m.role,
         content: m.content,
       })),
-      temperature: input.temperature,
+      temperature,
       max_tokens: input.maxOutputTokens,
       tools: oaiTools.length > 0 ? oaiTools : undefined,
       // Let the model choose freely between text and tool call. The
@@ -163,6 +193,8 @@ export class OpenAIChatProvider implements LLMProvider {
       { name: string; argsJson: string }
     >();
     let finalUsage: ToolChatFrame["usage"];
+    let firstDeltaAt: number | undefined;
+    let messageDeltaChunks = 0;
 
     for await (const part of stream) {
       const choice = part.choices[0];
@@ -183,6 +215,8 @@ export class OpenAIChatProvider implements LLMProvider {
 
       const delta = choice.delta;
       if (delta?.content) {
+        if (firstDeltaAt === undefined) firstDeltaAt = Date.now();
+        messageDeltaChunks += 1;
         yield { type: "message_delta", delta: delta.content };
       }
       if (delta?.tool_calls) {
@@ -200,6 +234,7 @@ export class OpenAIChatProvider implements LLMProvider {
     // surfaced as `args: {}` so the orchestrator can run zod validation
     // and report a clean error back to the model.
     const indices = [...toolBuffers.keys()].sort((a, b) => a - b);
+    let emittedToolCalls = 0;
     for (const idx of indices) {
       const buf = toolBuffers.get(idx)!;
       if (!buf.name) continue;
@@ -217,8 +252,20 @@ export class OpenAIChatProvider implements LLMProvider {
         }
       }
       yield { type: "tool_call", toolCall: { name: buf.name, args } };
+      emittedToolCalls += 1;
     }
 
+    log.info("chatWithTools", {
+      model,
+      messages: input.messages.length,
+      toolsExposed: tools.length,
+      messageDeltaChunks,
+      emittedToolCalls,
+      timeToFirstDeltaMs:
+        firstDeltaAt !== undefined ? firstDeltaAt - startedAt : null,
+      elapsedMs: Date.now() - startedAt,
+      usage: finalUsage,
+    });
     yield { type: "done", usage: finalUsage };
   }
 
@@ -355,6 +402,20 @@ export class OpenAIChatProvider implements LLMProvider {
       usage: response.usage,
     };
   }
+}
+
+/**
+ * Some model families (for example `gpt-5*`) reject custom temperature and
+ * only accept their default sampling behavior. In those cases, omit the field.
+ */
+function normalizeTemperatureForModel(
+  model: string,
+  temperature: number | undefined
+): number | undefined {
+  if (temperature === undefined) return undefined;
+  const normalized = model.trim().toLowerCase();
+  if (normalized.startsWith("gpt-5")) return undefined;
+  return temperature;
 }
 
 // ---- Internal: prompts and parsers ----

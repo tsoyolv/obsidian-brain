@@ -15,6 +15,7 @@ export interface ChatSessionStore {
   put(session: ChatSession, systemPrompt: string): void;
   get(id: string): ChatSession | undefined;
   getSystemPrompt(id: string): string | undefined;
+  remove(id: string): void;
   all(): ChatSession[];
   /** True once the store has been seeded from the vault this process. */
   isHydrated(): boolean;
@@ -37,6 +38,11 @@ class InMemorySessionStore implements ChatSessionStore {
 
   getSystemPrompt(id: string): string | undefined {
     return this.prompts.get(id);
+  }
+
+  remove(id: string): void {
+    this.sessions.delete(id);
+    this.prompts.delete(id);
   }
 
   all(): ChatSession[] {

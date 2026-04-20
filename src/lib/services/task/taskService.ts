@@ -1,4 +1,5 @@
 import { getVaultService, VAULT_FOLDERS } from "@/lib/services/vault";
+import { getDataService } from "@/lib/services/data";
 import { getConfig } from "@/lib/config";
 import { task as renderTask } from "@/lib/markdown/helpers";
 import { ensureMarkdownExt } from "@/lib/utils/filenames";
@@ -93,7 +94,7 @@ class TaskServiceImpl implements TaskService {
     }
 
     const targetRel = input.targetFile
-      ? this.vault.safePathResolve(ensureMarkdownExt(input.targetFile))
+      ? this.vault.safePathResolve(normalizeMarkdownRelPath(input.targetFile))
       : DEFAULT_TASK_FILE;
 
     const t = log.time("createTask");
@@ -174,7 +175,7 @@ class TaskServiceImpl implements TaskService {
     archivedCount: number;
   }> {
     const sourcePath = targetFile
-      ? this.vault.safePathResolve(ensureMarkdownExt(targetFile))
+      ? this.vault.safePathResolve(normalizeMarkdownRelPath(targetFile))
       : DEFAULT_TASK_FILE;
     return this.archiveCompletedTasks(sourcePath, { force: true });
   }
@@ -233,6 +234,7 @@ class TaskServiceImpl implements TaskService {
     relPath: string,
     options: { force?: boolean } = {}
   ): Promise<{ sourcePath: string; archivePath: string | null; archivedCount: number }> {
+    const dataService = getDataService();
     const { raw } = await this.vault.readNote(relPath);
     const lines = raw.split(/\r?\n/);
     const doneIndexes: number[] = [];
@@ -243,9 +245,27 @@ class TaskServiceImpl implements TaskService {
       if (done) doneIndexes.push(i);
     }
     if (!options.force && doneIndexes.length < this.archiveDoneThreshold) {
+      try {
+        await dataService.archiveTaskSnapshot({
+          sourcePath: relPath,
+          archivePath: null,
+          archivedCount: 0,
+        });
+      } catch (err) {
+        log.warn("archiveCompletedTasks: data snapshot failed", { source: relPath, err: String(err) });
+      }
       return { sourcePath: relPath, archivePath: null, archivedCount: 0 };
     }
     if (doneIndexes.length === 0) {
+      try {
+        await dataService.archiveTaskSnapshot({
+          sourcePath: relPath,
+          archivePath: null,
+          archivedCount: 0,
+        });
+      } catch (err) {
+        log.warn("archiveCompletedTasks: data snapshot failed", { source: relPath, err: String(err) });
+      }
       return { sourcePath: relPath, archivePath: null, archivedCount: 0 };
     }
 
@@ -264,6 +284,17 @@ class TaskServiceImpl implements TaskService {
     const doneSet = new Set(doneIndexes);
     const kept = lines.filter((_, idx) => !doneSet.has(idx)).join("\n");
     await this.vault.writeRawNote(relPath, kept);
+    try {
+      await dataService.archiveTaskSnapshot({
+        sourcePath: relPath,
+        archivePath,
+        archivedCount: doneLines.length,
+      });
+    } catch (err) {
+      log.warn("archiveCompletedTasks: data snapshot failed", { source: relPath, err: String(err) });
+      // Keep task archive semantics unchanged even if Data integration fails.
+      await dataService.buildIndex({ scope: "index" });
+    }
     log.info("archiveCompletedTasks", {
       source: relPath,
       archived: doneLines.length,
@@ -339,4 +370,12 @@ function currentMonthKey(): string {
 function topLevelFolder(relPath: string): string | undefined {
   const segs = relPath.split(/[\\/]/).filter(Boolean);
   return segs[0];
+}
+
+function normalizeMarkdownRelPath(input: string): string {
+  const parts = input.split(/[\\/]/).filter(Boolean);
+  if (parts.length === 0) return ensureMarkdownExt(input);
+  const leaf = parts.pop()!;
+  const normalizedLeaf = ensureMarkdownExt(leaf);
+  return [...parts, normalizedLeaf].join("/");
 }

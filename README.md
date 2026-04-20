@@ -65,7 +65,8 @@ folders exist inside your `OBSIDIAN_VAULT_PATH`:
 │                   # Optional summary + action items live inline in
 │                   # each chat's YAML frontmatter (chat_summary,
 │                   # chat_summary_action_items) — no separate folder.
-└── Tasks/          # Task files (`tasks.md` by default; daily / project files allowed)
+├── Tasks/          # Task files (`tasks.md` by default; daily / project files allowed)
+└── Data/           # Data Brain artifacts (Chats, Concepts, Cases, Tasks snapshots, Indexes)
 ```
 
 All files use YAML frontmatter where appropriate so they remain searchable in
@@ -109,6 +110,7 @@ Required variables:
 | `FILE_AUTO_READ_MAX_CHARS` | Auto-read size limit for single-hit file opens without confirmation (default `1000`). |
 | `FILE_PREVIEW_TOTAL_CHARS` | Total character budget for bounded multi-file previews used during autonomous file selection (default `1500`). |
 | `TASK_ARCHIVE_DONE_THRESHOLD` | Done-task count that triggers auto-archive on `complete_task` (default `50`). |
+| `DATA_CONCEPT_DECOMPOSITION_THRESHOLD_CHARS` | Concept size threshold for concept→cases decomposition (default `3000`). |
 | `WEB_SEARCH_PROVIDER`  | Web search provider id (`tavily`).                       |
 | `TAVILY_API_KEY`       | API key for Tavily web search tool.                      |
 | `OPENAI_MODEL_STT`     | Whisper model id (e.g. `whisper-1`).                     |
@@ -161,6 +163,22 @@ and rendered as a pinned card at the top of the chat, so it survives
 page reloads and is visible both in the app and when opening the `.md`
 file in Obsidian.
 
+## Data Brain Workflow
+
+Summarize now drives an incremental "Data Brain" pipeline:
+
+- `AI Chats/<session>.md` remains the primary transcript.
+- `Data/Chats/<sessionId>.md` stores structured chat archive data.
+- Concept extraction creates/merges notes in `Data/Concepts/`.
+- Large concepts may decompose into `Data/Cases/` (size + subtopic rules).
+- Wiki-links + auto-backlinks are maintained between chat/concept/case notes.
+- Indexes are rebuilt incrementally in `Data/Indexes/`:
+  - `topics.md`
+  - `chats.md`
+  - `tasks.md`
+- Task archiving keeps `Tasks/tasks.md` as the operational source and writes
+  short snapshots into `Data/Tasks/`.
+
 > Sessions are kept in memory for the dev server's lifetime. Markdown
 > transcripts in `AI Chats/` are the durable record; on restart, the
 > session list is rebuilt by scanning that folder.
@@ -178,6 +196,34 @@ file in Obsidian.
     the user clicks Confirm.
   - `answer_from_vault` reads at most the first ~1500 characters of each
     of the top-N keyword-matched notes — bounded partial reads only.
+
+## Manual Smoke Runbook
+
+Use this quick checklist after changes in chat/data/task flows:
+
+1. **Build + types**
+   - `npm run typecheck`
+   - `npm run build`
+2. **Summarize pipeline**
+   - create or pick a chat with messages
+   - call summarize (`POST /api/chat/summarize`)
+   - verify:
+     - `Data/Chats/<sessionId>.md` exists and has summary/action items
+     - `Data/Concepts/*` updated
+     - links/backlinks present
+     - `Data/Indexes/topics.md` and `Data/Indexes/chats.md` refreshed
+3. **Task archive compatibility**
+   - ensure `Tasks/tasks.md` exists with some done tasks
+   - call `POST /api/tasks/archive`
+   - verify:
+     - standard task archive behavior unchanged
+     - snapshot appears in `Data/Tasks/`
+     - `Data/Indexes/tasks.md` refreshed (`Task Sources`, `Task Archives`, `Data Snapshots`)
+4. **Agent tool wiring**
+   - verify tools are callable in agent mode:
+     - `archive_chat_to_data`
+     - `upsert_data_note`
+     - `link_data_notes`
 
 ---
 

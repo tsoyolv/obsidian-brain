@@ -6,6 +6,7 @@ import type { AgentEvent } from "@/lib/agent/orchestrator";
 import { getAgentSessionStore } from "@/lib/agent/session";
 import type { AgentMessage } from "@/lib/agent/types";
 import { getVaultService, VAULT_FOLDERS } from "@/lib/services/vault";
+import { getDataService } from "@/lib/services/data";
 import { compactLocalStamp, newId, nowIso } from "@/lib/utils/id";
 import { ensureMarkdownExt } from "@/lib/utils/filenames";
 import { createLogger } from "@/lib/utils/logger";
@@ -177,6 +178,16 @@ export interface ChatService {
    * Independent from `agentEnabled`; when false, agent keeps vault tools.
    */
   setWebSearchEnabled(sessionId: string, enabled: boolean): Promise<ChatSession>;
+  deleteSession(sessionId: string): Promise<{ deletedPath?: string }>;
+  archiveSession(sessionId: string): Promise<{ archivedPath?: string }>;
+  listArchivedSessions(): Promise<
+    Array<{ id: string; title: string; archivedPath: string; updatedAt: string }>
+  >;
+  getArchivedSession(id: string): Promise<ChatSession | undefined>;
+  listDeletedSessions(): Promise<
+    Array<{ id: string; title: string; deletedPath: string; updatedAt: string }>
+  >;
+  restoreDeletedSession(deletedPath: string): Promise<{ restoredPath: string }>;
   /**
    * Heuristic estimate of the prompt size that would be sent on the next
    * turn for this session (system + rolling summary + pinned + raw tail).
@@ -341,6 +352,8 @@ class ChatServiceImpl implements ChatService {
       if (p.role === "tool_call") {
         base.toolName = p.toolName;
         base.args = p.args;
+        base.plannerModel = p.plannerModel;
+        base.finalModel = p.finalModel;
       } else if (p.role === "tool_result") {
         base.toolName = p.toolName;
         base.result = p.result;
@@ -689,6 +702,167 @@ class ChatServiceImpl implements ChatService {
     return session;
   }
 
+  async deleteSession(sessionId: string): Promise<{ deletedPath?: string }> {
+    await this.ensureReady();
+    let session = this.store.get(sessionId);
+    if (!session) session = await this.hydrateSessionById(sessionId);
+    if (!session) {
+      throw new Error(`Unknown chat session: ${sessionId}`);
+    }
+    let deletedPath: string | undefined;
+    if (session.transcriptPath) {
+      const exists = await this.vault.fileExists(session.transcriptPath);
+      if (exists) {
+        const moved = await this.vault.softDelete(session.transcriptPath);
+        deletedPath = moved.path;
+      }
+    }
+    this.store.remove(sessionId);
+    getAgentSessionStore().remove(sessionId);
+    log.info("deleteSession", {
+      sessionId,
+      transcriptPath: session.transcriptPath,
+      deletedPath,
+    });
+    return { deletedPath };
+  }
+
+  async archiveSession(sessionId: string): Promise<{ archivedPath?: string }> {
+    await this.ensureReady();
+    let session = this.store.get(sessionId);
+    if (!session) session = await this.hydrateSessionById(sessionId);
+    if (!session) {
+      throw new Error(`Unknown chat session: ${sessionId}`);
+    }
+    let archivedPath: string | undefined;
+    if (session.transcriptPath) {
+      const exists = await this.vault.fileExists(session.transcriptPath);
+      if (exists) {
+        const filename = session.transcriptPath.split("/").pop() ?? `${session.id}.md`;
+        const moved = await this.vault.moveFile(
+          session.transcriptPath,
+          this.vault.joinPath(VAULT_FOLDERS.archivedChats, filename),
+          { uniqueOnConflict: true }
+        );
+        archivedPath = moved.path;
+      }
+    }
+    this.store.remove(sessionId);
+    getAgentSessionStore().remove(sessionId);
+    log.info("archiveSession", {
+      sessionId,
+      transcriptPath: session.transcriptPath,
+      archivedPath,
+    });
+    return { archivedPath };
+  }
+
+  async listArchivedSessions(): Promise<
+    Array<{ id: string; title: string; archivedPath: string; updatedAt: string }>
+  > {
+    await this.ensureReady();
+    const files = await this.vault.listFiles(VAULT_FOLDERS.archivedChats);
+    const out: Array<{ id: string; title: string; archivedPath: string; updatedAt: string }> = [];
+    for (const rel of files) {
+      try {
+        const note = await this.vault.readNote(rel);
+        const id = this.chatIdFromNote(note);
+        if (!id) continue;
+        const data = note.data as Record<string, unknown>;
+        const title =
+          typeof data.title === "string" && data.title.trim().length > 0
+            ? data.title.trim()
+            : stripMdExt(rel.split("/").pop() ?? rel);
+        const updatedAt =
+          typeof data.updated === "string" && data.updated
+            ? data.updated
+            : typeof data.created === "string" && data.created
+              ? data.created
+              : nowIso();
+        out.push({ id, title, archivedPath: rel, updatedAt });
+      } catch {
+        // best-effort listing; skip malformed archived files
+      }
+    }
+    out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return out;
+  }
+
+  async getArchivedSession(id: string): Promise<ChatSession | undefined> {
+    await this.ensureReady();
+    const files = await this.vault.listFiles(VAULT_FOLDERS.archivedChats);
+    for (const rel of files) {
+      try {
+        const note = await this.vault.readNote(rel);
+        const noteId = this.chatIdFromNote(note);
+        if (noteId !== id) continue;
+        return this.sessionFromNote(rel, note, noteId);
+      } catch {
+        // skip malformed files
+      }
+    }
+    return undefined;
+  }
+
+  async listDeletedSessions(): Promise<
+    Array<{ id: string; title: string; deletedPath: string; updatedAt: string }>
+  > {
+    await this.ensureReady();
+    const files = await this.vault.listFiles("Deleted");
+    const out: Array<{ id: string; title: string; deletedPath: string; updatedAt: string }> = [];
+    for (const rel of files) {
+      if (!rel.startsWith(`Deleted/${VAULT_FOLDERS.aiChats}/`)) continue;
+      try {
+        const note = await this.vault.readNote(rel);
+        const id = this.chatIdFromNote(note);
+        if (!id) continue;
+        const data = note.data as Record<string, unknown>;
+        const title =
+          typeof data.title === "string" && data.title.trim().length > 0
+            ? data.title.trim()
+            : stripMdExt(rel.split("/").pop() ?? rel);
+        const updatedAt =
+          typeof data.updated === "string" && data.updated
+            ? data.updated
+            : typeof data.created === "string" && data.created
+              ? data.created
+              : nowIso();
+        out.push({ id, title, deletedPath: rel, updatedAt });
+      } catch {
+        // best-effort listing; skip malformed deleted files
+      }
+    }
+    out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return out;
+  }
+
+  async restoreDeletedSession(deletedPath: string): Promise<{ restoredPath: string }> {
+    await this.ensureReady();
+    const note = await this.vault.readNote(deletedPath);
+    const id = this.chatIdFromNote(note);
+    if (!id) {
+      throw new Error("Deleted file is not a chat transcript.");
+    }
+    const moved = await this.vault.restoreDeleted(deletedPath, {
+      uniqueOnConflict: true,
+    });
+    // Ensure a stale in-memory copy never survives a restore, then hydrate
+    // the restored transcript back into the hot store so it appears in
+    // `/api/chat/sessions` immediately (without process restart).
+    this.store.remove(id);
+    const restoredNote = await this.vault.readNote(moved.path);
+    const restoredId = this.chatIdFromNote(restoredNote);
+    if (!restoredId) {
+      throw new Error("Restored file is missing chat id frontmatter.");
+    }
+    const restoredSession = this.sessionFromNote(moved.path, restoredNote, restoredId);
+    this.store.put(
+      restoredSession,
+      this.store.getSystemPrompt(restoredId) ?? DEFAULT_SYSTEM_PROMPT
+    );
+    return { restoredPath: moved.path };
+  }
+
   estimateNextPromptTokens(session: ChatSession): number {
     const systemPrompt =
       this.store.getSystemPrompt(session.id) ?? DEFAULT_SYSTEM_PROMPT;
@@ -754,6 +928,15 @@ class ChatServiceImpl implements ChatService {
     // excludes the tail (including the just-appended user message), so the
     // new message is guaranteed to reach the model raw.
     await this.maybeCompact(session, systemPrompt);
+
+    log.info("chat turn: execution mode", {
+      sessionId: session.id,
+      mode: session.agentEnabled ? "agent" : "plain-chat",
+      agentEnabled: Boolean(session.agentEnabled),
+      webSearchEnabled: session.webSearchEnabled !== false,
+      routedModel: route.model,
+      routedTier: route.tier,
+    });
 
     if (session.agentEnabled) {
       yield* this.streamAgentTurn(session, systemPrompt, route.model, tTurn);
@@ -997,6 +1180,13 @@ class ChatServiceImpl implements ChatService {
     const priorHistory = chatHistoryToAgentMessages(tailWithoutUser);
     const systemSuffix = this.buildAgentSystemSuffix(session, systemPrompt);
     const allowedTools = this.buildAgentAllowedTools(session);
+    const toolPlannerModel = cfg.openai.chatFastModel;
+    log.info("streamAgentTurn: model split", {
+      sessionId: session.id,
+      plannerModel: toolPlannerModel,
+      finalModel: modelOverride,
+      allowedTools: allowedTools?.length ?? 0,
+    });
 
     const assistantId = newId("msg");
     let assistantBuffer = "";
@@ -1011,6 +1201,7 @@ class ChatServiceImpl implements ChatService {
           systemSuffix,
           allowedTools,
           modelOverride,
+          toolModelOverride: toolPlannerModel,
         },
       })) {
         yielded = true;
@@ -1120,6 +1311,13 @@ class ChatServiceImpl implements ChatService {
     const priorHistory = chatHistoryToAgentMessages(session.messages);
     const systemSuffix = this.buildAgentSystemSuffix(session, systemPrompt);
     const allowedTools = this.buildAgentAllowedTools(session);
+    const toolPlannerModel = cfg.openai.chatFastModel;
+    log.info("confirmAgentTurn: model split", {
+      sessionId: session.id,
+      plannerModel: toolPlannerModel,
+      finalModel: route.model,
+      allowedTools: allowedTools?.length ?? 0,
+    });
 
     const assistantId = newId("msg");
     let assistantBuffer = "";
@@ -1134,6 +1332,7 @@ class ChatServiceImpl implements ChatService {
           systemSuffix,
           allowedTools,
           modelOverride: route.model,
+          toolModelOverride: toolPlannerModel,
         },
       })) {
         await this.handleAgentEvent(session, ev);
@@ -1247,6 +1446,8 @@ class ChatServiceImpl implements ChatService {
         createdAt: nowIso(),
         toolName: ev.name,
         args: ev.args,
+        plannerModel: ev.plannerModel,
+        finalModel: ev.finalModel,
       };
       session.messages.push(m);
       session.updatedAt = m.createdAt;
@@ -1332,6 +1533,9 @@ class ChatServiceImpl implements ChatService {
       "read_confirmed_file",
       "run_file_task",
       "answer_from_vault",
+      "archive_chat_to_data",
+      "upsert_data_note",
+      "link_data_notes",
       "soft_delete",
     ];
     if (session.webSearchEnabled !== false) {
@@ -1406,6 +1610,14 @@ class ChatServiceImpl implements ChatService {
 
     this.store.put(session, this.store.getSystemPrompt(sessionId) ?? "");
     await this.persistSessionState(session);
+    await getDataService().archiveChatSummary({
+      sessionId: session.id,
+      title: session.title,
+      generatedAt: chatSummary.generatedAt,
+      summaryMarkdown: chatSummary.text,
+      actionItems: chatSummary.actionItems,
+      transcriptPath: session.transcriptPath,
+    });
 
     t.done("summarize", {
       sessionId,

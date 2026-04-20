@@ -107,6 +107,8 @@ export type AgentEvent =
       callId: string;
       name: string;
       args: unknown;
+      plannerModel?: string;
+      finalModel?: string;
     }
   | {
       type: "tool_result";
@@ -152,6 +154,12 @@ export interface PriorContext {
   allowedTools?: string[];
   /** Optional model override for this turn. */
   modelOverride?: string;
+  /**
+   * Optional model override specifically for tool-planning iterations.
+   * When set, the loop uses this model for `chatWithTools`, while
+   * `modelOverride` is reserved for final synthesis text.
+   */
+  toolModelOverride?: string;
 }
 
 export interface RunTurnInput {
@@ -214,6 +222,7 @@ export async function* runTurn(
   const systemSuffix = input.priorContext?.systemSuffix;
   const allowedTools = input.priorContext?.allowedTools;
   const modelOverride = input.priorContext?.modelOverride;
+  const toolModelOverride = input.priorContext?.toolModelOverride;
 
   // (1) Drop pending if it has expired or already had its grace turn. We
   // do this BEFORE matching so a stale yes/no can't accidentally trigger
@@ -255,7 +264,8 @@ export async function* runTurn(
     undefined,
     systemSuffix,
     allowedTools,
-    modelOverride
+    modelOverride,
+    toolModelOverride
   );
 
   t.done("runTurn", {
@@ -478,6 +488,7 @@ export async function* confirmTurn(
   const systemSuffix = input.priorContext?.systemSuffix;
   const allowedTools = input.priorContext?.allowedTools;
   const modelOverride = input.priorContext?.modelOverride;
+  const toolModelOverride = input.priorContext?.toolModelOverride;
   const pending = session.pendingConfirmation;
 
   if (!pending || pending.token !== input.token) {
@@ -520,7 +531,8 @@ export async function* confirmTurn(
     undefined,
     systemSuffix,
     allowedTools,
-    modelOverride
+    modelOverride,
+    toolModelOverride
   );
 
   t.done("confirmTurn", {
@@ -565,7 +577,8 @@ async function* iterativeLoop(
   pendingContext?: PendingConfirmation,
   systemSuffix?: string,
   allowedTools?: string[],
-  modelOverride?: string
+  modelOverride?: string,
+  toolModelOverride?: string
 ): AsyncGenerator<AgentEvent, void, void> {
   const sessions = getAgentSessionStore();
   const llm = llmProviderFactory.get();
@@ -591,8 +604,18 @@ async function* iterativeLoop(
     // Re-read pending each iteration: it may have been consumed by a tool
     // we just ran, or replaced by a new gated call.
     const livePending = session.pendingConfirmation ?? pendingContext;
+    const toolPlannerModel = toolModelOverride ?? modelOverride;
+    const resolvedPlannerModel = toolPlannerModel ?? llm.defaultModel;
+    const resolvedFinalModel = modelOverride ?? llm.defaultModel;
+    const llmStepStartedAt = Date.now();
+    log.info("iterativeLoop: llm step start", {
+      sessionId,
+      plannerModel: resolvedPlannerModel,
+      finalModel: resolvedFinalModel,
+      toolCallsUsed,
+    });
     const chatInput: ChatInput = {
-      model: modelOverride,
+      model: toolPlannerModel,
       temperature: 0.2,
       messages: buildPromptMessages(session.messages, livePending, systemSuffix),
     };
@@ -607,10 +630,26 @@ async function* iterativeLoop(
         toolCall = frame.toolCall;
       }
     }
+    log.info("iterativeLoop: llm step done", {
+      sessionId,
+      plannerModel: resolvedPlannerModel,
+      emittedToolCall: Boolean(toolCall),
+      assistantChars: assistantText.length,
+      durationMs: Date.now() - llmStepStartedAt,
+    });
 
     // Path A — pure text reply. End the loop.
     if (!toolCall) {
-      const text = assistantText.trim();
+      let text = assistantText.trim();
+      if (modelOverride && toolPlannerModel && modelOverride !== toolPlannerModel) {
+        text = await synthesizeFinalResponse(
+          sessionId,
+          livePending,
+          systemSuffix,
+          modelOverride,
+          text
+        );
+      }
       if (text) {
         sessions.appendMessage(sessionId, {
           role: "assistant",
@@ -648,6 +687,8 @@ async function* iterativeLoop(
         callId,
         name: toolCall.name,
         args: toolCall.args,
+        plannerModel: resolvedPlannerModel,
+        finalModel: resolvedFinalModel,
       };
       yield {
         type: "tool_result",
@@ -693,6 +734,8 @@ async function* iterativeLoop(
         callId,
         name: tool.name,
         args: sanitizedArgs,
+        plannerModel: resolvedPlannerModel,
+        finalModel: resolvedFinalModel,
       };
       yield {
         type: "tool_result",
@@ -765,7 +808,10 @@ async function* iterativeLoop(
       return;
     }
 
-    const firstResult = yield* runToolAndYield(sessionId, tool, validatedArgs);
+    const firstResult = yield* runToolAndYield(sessionId, tool, validatedArgs, {
+      plannerModel: resolvedPlannerModel,
+      finalModel: resolvedFinalModel,
+    });
     if (
       tool.name === "complete_task" &&
       shouldAutopickAnyTask(sessions.get(sessionId)?.messages ?? [])
@@ -786,7 +832,15 @@ async function* iterativeLoop(
         triedTaskTexts.add(normalizeTaskText(nextTaskText));
         toolCallsUsed += 1;
         retries += 1;
-        latestResult = yield* runToolAndYield(sessionId, tool, { taskText: nextTaskText });
+        latestResult = yield* runToolAndYield(
+          sessionId,
+          tool,
+          { taskText: nextTaskText },
+          {
+            plannerModel: resolvedPlannerModel,
+            finalModel: resolvedFinalModel,
+          }
+        );
       }
     }
     // Loop again so the model can react to the tool result.
@@ -811,7 +865,8 @@ async function* resolveFromPending(
   pending: PendingConfirmation,
   intent: UserIntent,
   allowedTools?: string[],
-  modelOverride?: string
+  modelOverride?: string,
+  toolModelOverride?: string
 ): AsyncGenerator<AgentEvent, void, void> {
   const sessions = getAgentSessionStore();
 
@@ -884,7 +939,8 @@ async function* resolveFromPending(
     undefined,
     undefined,
     allowedTools,
-    modelOverride
+    modelOverride,
+    toolModelOverride
   );
 }
 
@@ -1082,7 +1138,8 @@ function discardStalePending(sessionId: string): void {
 async function* runToolAndYield(
   sessionId: string,
   tool: AnyAgentTool,
-  args: unknown
+  args: unknown,
+  modelMeta?: { plannerModel?: string; finalModel?: string }
 ): AsyncGenerator<AgentEvent, ToolResult<unknown>, void> {
   const sessions = getAgentSessionStore();
   const callId = newId("call");
@@ -1092,7 +1149,14 @@ async function* runToolAndYield(
     toolName: tool.name,
     args,
   });
-  yield { type: "tool_call", callId, name: tool.name, args };
+  yield {
+    type: "tool_call",
+    callId,
+    name: tool.name,
+    args,
+    plannerModel: modelMeta?.plannerModel,
+    finalModel: modelMeta?.finalModel,
+  };
 
   const ctx: ToolCtx = {
     sessionId,
@@ -1158,6 +1222,59 @@ async function finalSummary(
       err: err instanceof Error ? err.message : String(err),
     });
     return "(done — summary failed)";
+  }
+}
+
+async function synthesizeFinalResponse(
+  sessionId: string,
+  pendingContext: PendingConfirmation | undefined,
+  systemSuffix: string | undefined,
+  finalModel: string,
+  plannerDraft: string
+): Promise<string> {
+  const sessions = getAgentSessionStore();
+  const llm = llmProviderFactory.get();
+  const session = sessions.get(sessionId);
+  if (!session) return plannerDraft || "(no session)";
+  const startedAt = Date.now();
+  log.info("synthesizeFinalResponse: start", {
+    sessionId,
+    finalModel,
+    plannerDraftChars: plannerDraft.length,
+  });
+  try {
+    const resp = await llm.sendMessage({
+      model: finalModel,
+      temperature: 0.2,
+      messages: [
+        ...buildPromptMessages(session.messages, pendingContext, systemSuffix),
+        {
+          role: "system",
+          content:
+            "Provide the final user-facing answer now. Do not call tools. " +
+            "Be concise, accurate, and do not add facts not present in the conversation.",
+        },
+        ...(plannerDraft
+          ? [{ role: "assistant" as const, content: plannerDraft }]
+          : []),
+      ],
+    });
+    const text = resp.content.trim() || plannerDraft || "(done)";
+    log.info("synthesizeFinalResponse: done", {
+      sessionId,
+      finalModel,
+      outputChars: text.length,
+      durationMs: Date.now() - startedAt,
+    });
+    return text;
+  } catch (err) {
+    log.warn("synthesizeFinalResponse: failed, fallback to planner draft", {
+      sessionId,
+      finalModel,
+      err: err instanceof Error ? err.message : String(err),
+      durationMs: Date.now() - startedAt,
+    });
+    return plannerDraft || "(done)";
   }
 }
 

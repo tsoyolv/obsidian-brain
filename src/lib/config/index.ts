@@ -43,6 +43,9 @@ export interface AppConfig {
   tasks: {
     archiveDoneThreshold: number;
   };
+  data: {
+    conceptDecompositionThresholdChars: number;
+  };
   tavily: {
     apiKey: string | undefined;
   };
@@ -74,6 +77,8 @@ export function getConfig(): AppConfig {
     FILE_AUTO_READ_MAX_CHARS: process.env.FILE_AUTO_READ_MAX_CHARS,
     FILE_PREVIEW_TOTAL_CHARS: process.env.FILE_PREVIEW_TOTAL_CHARS,
     TASK_ARCHIVE_DONE_THRESHOLD: process.env.TASK_ARCHIVE_DONE_THRESHOLD,
+    DATA_CONCEPT_DECOMPOSITION_THRESHOLD_CHARS:
+      process.env.DATA_CONCEPT_DECOMPOSITION_THRESHOLD_CHARS,
     TAVILY_API_KEY: process.env.TAVILY_API_KEY,
   });
 
@@ -111,6 +116,10 @@ export function getConfig(): AppConfig {
     },
     tasks: {
       archiveDoneThreshold: env.TASK_ARCHIVE_DONE_THRESHOLD,
+    },
+    data: {
+      conceptDecompositionThresholdChars:
+        env.DATA_CONCEPT_DECOMPOSITION_THRESHOLD_CHARS,
     },
     tavily: {
       apiKey: env.TAVILY_API_KEY,

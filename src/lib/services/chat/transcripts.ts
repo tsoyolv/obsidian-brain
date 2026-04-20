@@ -32,7 +32,11 @@ export function renderChatMessageMarkdown(m: ChatMessage): string {
     const name = m.toolName ?? "?";
     const payload =
       m.role === "tool_call"
-        ? { args: m.args ?? null }
+        ? {
+            args: m.args ?? null,
+            plannerModel: m.plannerModel ?? null,
+            finalModel: m.finalModel ?? null,
+          }
         : { result: m.result ?? null };
     const json = safeJson(payload);
     const body = [
@@ -62,6 +66,8 @@ export interface ParsedTranscriptMessage {
   /** Set on tool entries; extracted from the `<summary>` line. */
   toolName?: string;
   args?: unknown;
+  plannerModel?: string;
+  finalModel?: string;
   result?: unknown;
 }
 
@@ -120,10 +126,14 @@ export function parseTranscriptMarkdown(
         toolName,
       };
       if (cur.role === "tool_call") {
-        entry.args =
-          parsedJson && typeof parsedJson === "object" && parsedJson !== null
-            ? (parsedJson as Record<string, unknown>).args
-            : undefined;
+        if (parsedJson && typeof parsedJson === "object" && parsedJson !== null) {
+          const obj = parsedJson as Record<string, unknown>;
+          entry.args = obj.args;
+          entry.plannerModel =
+            typeof obj.plannerModel === "string" ? obj.plannerModel : undefined;
+          entry.finalModel =
+            typeof obj.finalModel === "string" ? obj.finalModel : undefined;
+        }
       } else {
         entry.result =
           parsedJson && typeof parsedJson === "object" && parsedJson !== null

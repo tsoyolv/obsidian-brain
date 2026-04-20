@@ -16,6 +16,20 @@ export interface SessionSummary {
   tier?: "fast" | "standard" | "reasoning";
 }
 
+export interface DeletedSessionSummary {
+  id: string;
+  title: string;
+  deletedPath: string;
+  updatedAt: string;
+}
+
+export interface ArchivedSessionSummary {
+  id: string;
+  title: string;
+  archivedPath: string;
+  updatedAt: string;
+}
+
 export type SessionSortMode =
   | "updated_desc"
   | "updated_asc"
@@ -26,8 +40,15 @@ export type SessionSortMode =
 
 interface Props {
   sessions: SessionSummary[];
+  archivedSessions?: ArchivedSessionSummary[];
+  deletedSessions?: DeletedSessionSummary[];
   currentId: string | null;
   onSelect: (id: string) => void;
+  onSelectArchived?: (id: string) => void;
+  onDelete: (id: string) => void;
+  deletingId?: string | null;
+  onRestore?: (deletedPath: string) => void;
+  restoringPath?: string | null;
   onCreate: () => void;
   sortMode: SessionSortMode;
   onSortModeChange: (mode: SessionSortMode) => void;
@@ -37,8 +58,15 @@ interface Props {
 
 export function ChatSessionList({
   sessions,
+  archivedSessions,
+  deletedSessions,
   currentId,
   onSelect,
+  onSelectArchived,
+  onDelete,
+  deletingId,
+  onRestore,
+  restoringPath,
   onCreate,
   sortMode,
   onSortModeChange,
@@ -92,32 +120,103 @@ export function ChatSessionList({
           <ul className="divide-y divide-bg-border">
             {sessions.map((s) => {
               const active = s.id === currentId;
+              const deleting = deletingId === s.id;
               return (
                 <li key={s.id}>
-                  <button
-                    type="button"
-                    onClick={() => onSelect(s.id)}
+                  <div
                     className={
-                      "flex w-full flex-col items-start gap-0.5 px-3 py-2 text-left text-sm " +
-                      (active
-                        ? "bg-accent/10 text-ink"
-                        : "text-ink-muted hover:bg-bg-elevated")
+                      "flex items-start gap-2 px-2 py-1.5 " +
+                      (active ? "bg-accent/10" : "hover:bg-bg-elevated")
                     }
                   >
-                    <span className="line-clamp-1 font-medium text-ink">
-                      {s.title}
-                    </span>
-                    <span className="text-[11px] text-ink-dim">
-                      {s.messageCount} msg ·{" "}
-                      {new Date(s.updatedAt).toLocaleString()}
-                    </span>
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => onSelect(s.id)}
+                      className="min-w-0 flex-1 rounded px-1 py-0.5 text-left text-sm text-ink-muted"
+                    >
+                      <span className="line-clamp-1 font-medium text-ink">
+                        {s.title}
+                      </span>
+                      <span className="text-[11px] text-ink-dim">
+                        {s.messageCount} msg ·{" "}
+                        {new Date(s.updatedAt).toLocaleString()}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onDelete(s.id)}
+                      disabled={deleting}
+                      className="mt-0.5 rounded border border-bg-border bg-bg px-2 py-1 text-[10px] text-ink-dim hover:bg-bg-elevated disabled:cursor-not-allowed disabled:opacity-60"
+                      title="Move chat to Deleted/"
+                    >
+                      {deleting ? "…" : "Delete"}
+                    </button>
+                  </div>
                 </li>
               );
             })}
           </ul>
         )}
       </div>
+      {archivedSessions && archivedSessions.length > 0 ? (
+        <div className="rounded-xl border border-bg-border bg-bg-panel">
+          <div className="border-b border-bg-border px-3 py-2 text-[11px] uppercase tracking-wider text-ink-dim">
+            Archived chats (read-only)
+          </div>
+          <ul className="divide-y divide-bg-border">
+            {archivedSessions.slice(0, 10).map((s) => (
+              <li key={s.id}>
+                <button
+                  type="button"
+                  onClick={() => onSelectArchived?.(s.id)}
+                  className={
+                    "flex w-full flex-col items-start gap-0.5 px-3 py-2 text-left text-sm " +
+                    (s.id === currentId
+                      ? "bg-accent/10 text-ink"
+                      : "text-ink-muted hover:bg-bg-elevated")
+                  }
+                >
+                  <span className="line-clamp-1 font-medium text-ink">{s.title}</span>
+                  <span className="text-[11px] text-ink-dim">
+                    archived · {new Date(s.updatedAt).toLocaleString()}
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {deletedSessions && deletedSessions.length > 0 ? (
+        <div className="rounded-xl border border-bg-border bg-bg-panel">
+          <div className="border-b border-bg-border px-3 py-2 text-[11px] uppercase tracking-wider text-ink-dim">
+            Deleted chats
+          </div>
+          <ul className="divide-y divide-bg-border">
+            {deletedSessions.slice(0, 8).map((s) => {
+              const restoring = restoringPath === s.deletedPath;
+              return (
+                <li key={s.deletedPath} className="flex items-start gap-2 px-2 py-1.5">
+                  <div className="min-w-0 flex-1 px-1 py-0.5">
+                    <div className="line-clamp-1 text-sm text-ink">{s.title}</div>
+                    <div className="text-[11px] text-ink-dim">
+                      {new Date(s.updatedAt).toLocaleString()}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onRestore?.(s.deletedPath)}
+                    disabled={restoring}
+                    className="mt-0.5 rounded border border-bg-border bg-bg px-2 py-1 text-[10px] text-ink-dim hover:bg-bg-elevated disabled:cursor-not-allowed disabled:opacity-60"
+                    title="Restore chat from Deleted/"
+                  >
+                    {restoring ? "…" : "Restore"}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ) : null}
     </div>
   );
 }

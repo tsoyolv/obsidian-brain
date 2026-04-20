@@ -12,6 +12,9 @@ import { runFileTaskTool } from "./run_file_task";
 import { answerFromVaultTool } from "./answer_from_vault";
 import { softDeleteTool } from "./soft_delete";
 import { webSearchTool } from "./web_search";
+import { archiveChatToDataTool } from "./archive_chat_to_data";
+import { upsertDataNoteTool } from "./upsert_data_note";
+import { linkDataNotesTool } from "./link_data_notes";
 
 /**
  * The tool registry. Single source of truth the orchestrator (and any
@@ -36,6 +39,9 @@ const allTools: AnyAgentTool[] = [
   answerFromVaultTool,
   softDeleteTool,
   webSearchTool,
+  archiveChatToDataTool,
+  upsertDataNoteTool,
+  linkDataNotesTool,
 ];
 
 export const toolRegistry: Map<string, AnyAgentTool> = new Map(
@@ -64,4 +70,7 @@ export {
   answerFromVaultTool,
   softDeleteTool,
   webSearchTool,
+  archiveChatToDataTool,
+  upsertDataNoteTool,
+  linkDataNotesTool,
 };

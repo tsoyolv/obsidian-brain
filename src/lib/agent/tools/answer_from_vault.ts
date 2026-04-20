@@ -1,8 +1,9 @@
 import { z } from "zod";
 import { llmProviderFactory } from "@/lib/providers/llm";
 import { getSearchService } from "@/lib/services/search";
+import { getChatService } from "@/lib/services/chat";
 import { getVaultService } from "@/lib/services/vault";
-import type { SearchHit } from "@/lib/types";
+import type { ChatSession, SearchHit } from "@/lib/types";
 import type { AgentTool } from "../types";
 
 const ParamsSchema = z.object({
@@ -24,7 +25,7 @@ const ParamsSchema = z.object({
 
 export interface AnswerFromVaultOutput {
   answer: string;
-  sources: { path: string; title: string }[];
+  sources: { path: string; title: string; origin: "data" | "active_chat" | "recent_chat" }[];
 }
 
 /**
@@ -36,6 +37,18 @@ export interface AnswerFromVaultOutput {
  * captureService.ts has historically enforced.
  */
 const ASK_CONTEXT_HEAD_CHARS = 1500;
+const RECENT_CHAT_CANDIDATES = 5;
+const ACTIVE_CHAT_SCORE_BOOST = 3;
+const CHAT_MESSAGE_TAIL = 24;
+
+interface UnifiedHit {
+  path: string;
+  title: string;
+  snippet: string;
+  score: number;
+  origin: "data" | "active_chat" | "recent_chat";
+  chatSessionId?: string;
+}
 
 /**
  * Answer a question using only vault content.
@@ -67,41 +80,76 @@ export const answerFromVaultTool: AgentTool<
   parameters: ParamsSchema,
   async run(input, ctx) {
     const search = getSearchService();
+    const chat = getChatService();
     const vault = getVaultService();
     const llm = llmProviderFactory.get();
 
     const topK = input.topK ?? 5;
-    const layered = await search.searchLayered(input.question, {
+    const layeredData = await search.searchLayered(input.question, {
       limit: topK,
+      folder: "Data",
     });
 
     // strong-first; one near-miss appended when we have headroom and at
     // least one near hit. De-dupe by path so the same file doesn't burn
     // two slots of the context budget.
-    const seen = new Set<string>();
-    const picked: SearchHit[] = [];
-    for (const h of layered.strong.slice(0, topK)) {
-      if (seen.has(h.path)) continue;
-      seen.add(h.path);
-      picked.push(h);
+    const seenData = new Set<string>();
+    const dataPicked: SearchHit[] = [];
+    for (const h of layeredData.strong.slice(0, topK)) {
+      if (seenData.has(h.path)) continue;
+      seenData.add(h.path);
+      dataPicked.push(h);
     }
-    if (picked.length < topK && layered.near.length > 0) {
-      const candidate = layered.near[0]!;
-      if (!seen.has(candidate.path)) {
-        seen.add(candidate.path);
-        picked.push(candidate);
+    if (dataPicked.length < topK && layeredData.near.length > 0) {
+      const candidate = layeredData.near[0]!;
+      if (!seenData.has(candidate.path)) {
+        seenData.add(candidate.path);
+        dataPicked.push(candidate);
       }
     }
 
+    const tokens = tokenize(input.question);
+    const activeSession = await chat.getSession(ctx.sessionId);
+    const allSessions = await chat.listSessions();
+    const recentSessions = allSessions
+      .filter((s) => s.id !== ctx.sessionId && Boolean(s.transcriptPath))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+      .slice(0, RECENT_CHAT_CANDIDATES);
+
+    const unified: UnifiedHit[] = [];
+    for (const h of dataPicked) {
+      unified.push({
+        ...h,
+        origin: "data",
+      });
+    }
+    if (activeSession) {
+      const hit = makeChatHit(activeSession, "active_chat", tokens);
+      if (hit) {
+        hit.score += ACTIVE_CHAT_SCORE_BOOST;
+        unified.push(hit);
+      }
+    }
+    for (const s of recentSessions) {
+      const hit = makeChatHit(s, "recent_chat", tokens);
+      if (hit) unified.push(hit);
+    }
+    unified.sort((a, b) => b.score - a.score);
+    const picked = dedupeUnified(unified).slice(0, topK);
+
     const contextParts: string[] = [];
     for (const h of picked) {
-      try {
-        const note = await vault.readNote(h.path);
-        const trimmed = note.body.slice(0, ASK_CONTEXT_HEAD_CHARS);
-        contextParts.push(`--- ${h.path} ---\n${trimmed}`);
-      } catch {
-        // unreadable notes just don't contribute context
+      if (h.origin === "data") {
+        try {
+          const note = await vault.readNote(h.path);
+          const trimmed = note.body.slice(0, ASK_CONTEXT_HEAD_CHARS);
+          contextParts.push(`--- ${h.path} (${h.origin}) ---\n${trimmed}`);
+        } catch {
+          // unreadable notes just don't contribute context
+        }
+        continue;
       }
+      contextParts.push(`--- ${h.path} (${h.origin}) ---\n${h.snippet}`);
     }
     const context =
       contextParts.join("\n\n") || "(no relevant notes found)";
@@ -124,15 +172,79 @@ export const answerFromVaultTool: AgentTool<
 
     ctx.logger.info("answer_from_vault: done", {
       question: input.question,
-      strong: layered.strong.length,
-      near: layered.near.length,
+      dataStrong: layeredData.strong.length,
+      dataNear: layeredData.near.length,
       picked: picked.length,
       answerChars: resp.content.length,
     });
 
     return {
       answer: resp.content.trim() || "(no answer)",
-      sources: picked.map((h) => ({ path: h.path, title: h.title })),
+      sources: picked.map((h) => ({ path: h.path, title: h.title, origin: h.origin })),
     };
   },
 };
+
+function makeChatHit(
+  session: ChatSession,
+  origin: "active_chat" | "recent_chat",
+  tokens: string[]
+): UnifiedHit | undefined {
+  const recentMessages = session.messages.slice(-CHAT_MESSAGE_TAIL);
+  const text = recentMessages.map((m) => m.content).join("\n");
+  const score = scoreQuery(tokens, `${session.title}\n${text}`);
+  if (score <= 0) return undefined;
+  const path = session.transcriptPath ?? `chat:${session.id}`;
+  return {
+    path,
+    title: session.title,
+    snippet: text.slice(0, ASK_CONTEXT_HEAD_CHARS),
+    score,
+    origin,
+    chatSessionId: session.id,
+  };
+}
+
+function dedupeUnified(hits: UnifiedHit[]): UnifiedHit[] {
+  const out: UnifiedHit[] = [];
+  const seen = new Set<string>();
+  for (const h of hits) {
+    const key = `${h.origin}:${h.path}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(h);
+  }
+  return out;
+}
+
+function tokenize(query: string): string[] {
+  const trimmed = query.trim();
+  const minLen = trimmed.length <= 3 ? 1 : 2;
+  return trimmed
+    .toLowerCase()
+    .split(/[^a-z0-9_\-а-яё]+/i)
+    .filter((s) => s.length >= minLen);
+}
+
+function scoreQuery(tokens: string[], haystack: string): number {
+  if (tokens.length === 0) return 0;
+  const lower = haystack.toLowerCase();
+  let score = 0;
+  for (const t of tokens) {
+    if (!t) continue;
+    if (lower.includes(t)) score += 2;
+    score += countOccurrences(lower, t);
+  }
+  return score;
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let idx = 0;
+  while ((idx = haystack.indexOf(needle, idx)) !== -1) {
+    count += 1;
+    idx += needle.length;
+  }
+  return count;
+}

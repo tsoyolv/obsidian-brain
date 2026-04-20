@@ -18,6 +18,8 @@ export type AgentStep =
       callId: string;
       name: string;
       args: unknown;
+      plannerModel?: string;
+      finalModel?: string;
       result?: ToolResult<unknown>;
       /**
        * True after the user explicitly confirmed this tool. Used by
@@ -214,7 +216,7 @@ export function ToolStepChip({
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
-        className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-[11px] hover:bg-bg-elevated/40"
+        className="flex w-full min-w-0 flex-wrap items-center gap-2 px-2 py-1.5 text-left text-[11px] hover:bg-bg-elevated/40"
       >
         <span
           className={`pill ${
@@ -227,14 +229,32 @@ export function ToolStepChip({
         >
           {step.name}
         </span>
-        <span className="truncate font-mono text-ink-dim">{argsPreview}</span>
+        <span className="min-w-0 flex-1 truncate font-mono text-ink-dim">
+          {argsPreview}
+        </span>
+        {step.plannerModel ? (
+          <span
+            className="pill border-sky-500/40 text-sky-300"
+            title="Model used to decide and run tool steps"
+          >
+            tool: {step.plannerModel}
+          </span>
+        ) : null}
+        {step.finalModel ? (
+          <span
+            className="pill border-violet-500/40 text-violet-300"
+            title="Model used for final user-facing synthesis"
+          >
+            final: {step.finalModel}
+          </span>
+        ) : null}
         {!finished ? (
-          <span className="ml-auto inline-flex items-center gap-1 text-ink-dim">
+          <span className="inline-flex items-center gap-1 text-ink-dim sm:ml-auto">
             <Spinner size={10} />
             running
           </span>
         ) : (
-          <span className="ml-auto text-ink-dim">{expanded ? "▾" : "▸"}</span>
+          <span className="text-ink-dim sm:ml-auto">{expanded ? "▾" : "▸"}</span>
         )}
       </button>
 
@@ -308,7 +328,14 @@ export function ConfirmationCard({
  * server-only orchestrator deps.
  */
 export type AgentSseEvent =
-  | { type: "tool_call"; callId: string; name: string; args: unknown }
+  | {
+      type: "tool_call";
+      callId: string;
+      name: string;
+      args: unknown;
+      plannerModel?: string;
+      finalModel?: string;
+    }
   | {
       type: "tool_result";
       callId: string;
@@ -362,6 +389,8 @@ export function applyAgentEvent(
           callId: ev.callId,
           name: ev.name,
           args: ev.args,
+          plannerModel: ev.plannerModel,
+          finalModel: ev.finalModel,
           confirmed,
         },
       ],

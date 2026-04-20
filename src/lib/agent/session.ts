@@ -105,6 +105,8 @@ export interface AgentSessionStore {
   setTotalTokensUsed(id: string, total: number): AgentSession;
   /** Snapshot of all sessions, newest-first. Intended for diagnostics. */
   all(): AgentSession[];
+  /** Remove a session from the in-memory store. */
+  remove(id: string): void;
 }
 
 class InMemoryAgentSessionStore implements AgentSessionStore {
@@ -207,6 +209,10 @@ class InMemoryAgentSessionStore implements AgentSessionStore {
     return [...this.sessions.values()].sort((a, b) =>
       b.updatedAt.localeCompare(a.updatedAt)
     );
+  }
+
+  remove(id: string): void {
+    this.sessions.delete(id);
   }
 }
 

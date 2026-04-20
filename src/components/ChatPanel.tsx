@@ -4,6 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import {
   ChatSessionList,
+  type ArchivedSessionSummary,
+  type DeletedSessionSummary,
   type SessionSortMode,
   type SessionSummary,
 } from "./ChatSessionList";
@@ -37,6 +39,7 @@ interface SessionFull {
   model?: string;
   tier?: "fast" | "standard" | "reasoning";
   chatSummary?: ChatSummary;
+  archived?: boolean;
 }
 
 interface TurnUsage {
@@ -75,6 +78,8 @@ interface ActiveAgentTurn {
 
 export function ChatPanel() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [archivedSessions, setArchivedSessions] = useState<ArchivedSessionSummary[]>([]);
+  const [deletedSessions, setDeletedSessions] = useState<DeletedSessionSummary[]>([]);
   const [sortMode, setSortMode] = useState<SessionSortMode>("updated_desc");
   const [current, setCurrent] = useState<SessionFull | null>(null);
   const [creating, setCreating] = useState(false);
@@ -84,10 +89,16 @@ export function ChatPanel() {
   const [activeAgent, setActiveAgent] = useState<ActiveAgentTurn | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [summarizing, setSummarizing] = useState(false);
+  const [summarizeDialogOpen, setSummarizeDialogOpen] = useState(false);
+  const [summarizePostAction, setSummarizePostAction] = useState<"archive" | "delete">(
+    "archive"
+  );
   const [tokenLimit, setTokenLimit] = useState<number>(DEFAULT_TOKEN_LIMIT);
   const [lastTurn, setLastTurn] = useState<TurnUsage | null>(null);
   const [loadingSession, setLoadingSession] = useState(false);
   const [loadingSessions, setLoadingSessions] = useState(true);
+  const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
+  const [restoringPath, setRestoringPath] = useState<string | null>(null);
   const [transcribing, setTranscribing] = useState(false);
   const [togglingAgent, setTogglingAgent] = useState(false);
   const [togglingWebSearch, setTogglingWebSearch] = useState(false);
@@ -121,12 +132,37 @@ export function ChatPanel() {
     }
   }, []);
 
+  const refreshDeletedSessions = useCallback(async () => {
+    try {
+      const res = await fetch("/api/chat/deleted");
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error?.message ?? "Failed to load deleted");
+      setDeletedSessions((json.data.sessions ?? []) as DeletedSessionSummary[]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  const refreshArchivedSessions = useCallback(async () => {
+    try {
+      const res = await fetch("/api/chat/archived");
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error?.message ?? "Failed to load archived");
+      setArchivedSessions((json.data.sessions ?? []) as ArchivedSessionSummary[]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
   useEffect(() => {
     refreshSessions();
-  }, [refreshSessions]);
+    refreshArchivedSessions();
+    refreshDeletedSessions();
+  }, [refreshSessions, refreshArchivedSessions, refreshDeletedSessions]);
 
   useEffect(() => {
     if (!current) return;
+    if (current.archived) return;
     const fresh = sessions.find((s) => s.id === current.id);
     if (!fresh) return;
     if (
@@ -261,6 +297,30 @@ export function ChatPanel() {
             });
           });
         });
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoadingSession(false);
+    }
+  }
+
+  async function selectArchivedSession(id: string) {
+    if (current?.id === id && current.archived) return;
+    const found = archivedSessions.find((s) => s.id === id);
+    if (!found) return;
+    setError(null);
+    setLoadingSession(true);
+    setActiveAgent(null);
+    setLastTurn(null);
+    try {
+      const res = await fetch(`/api/chat/archived/${encodeURIComponent(id)}`);
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error?.message ?? "Failed to load archived chat");
+      const full = json.data as SessionFull;
+      setCurrent(full);
+      if (typeof json.data.tokenLimit === "number") {
+        setTokenLimit(json.data.tokenLimit);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -449,6 +509,10 @@ export function ChatPanel() {
   async function sendMessage(overrideText?: string) {
     const value = (overrideText ?? draft).trim();
     if (!value || streaming) return;
+    if (current?.archived) {
+      setError("Archived chats are read-only.");
+      return;
+    }
     let session = current;
     if (!session) {
       session = await createSession();
@@ -597,6 +661,8 @@ export function ChatPanel() {
             createdAt: now,
             toolName: step.name,
             args: step.args,
+            plannerModel: step.plannerModel,
+            finalModel: step.finalModel,
           });
           if (step.result) {
             newMsgs.push({
@@ -778,15 +844,16 @@ export function ChatPanel() {
     await sendMessage(text);
   }
 
-  async function summarize() {
-    if (!current || summarizing) return;
+  async function summarizeWithAction(postAction: "archive" | "delete") {
+    if (!current || summarizing || current.archived) return;
+    const sessionId = current.id;
     setSummarizing(true);
     setError(null);
     try {
       const res = await fetch("/api/chat/summarize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: current.id }),
+        body: JSON.stringify({ sessionId }),
       });
       const json = await res.json();
       if (!json.ok) throw new Error(json.error?.message ?? "Failed");
@@ -799,7 +866,7 @@ export function ChatPanel() {
           : undefined;
       if (chatSummary) {
         setCurrent((prev) =>
-          prev && prev.id === current.id
+          prev && prev.id === sessionId
             ? {
                 ...prev,
                 chatSummary,
@@ -813,7 +880,7 @@ export function ChatPanel() {
         if (totalTokensUsed !== undefined) {
           setSessions((prev) =>
             prev.map((s) =>
-              s.id === current.id ? { ...s, totalTokensUsed } : s
+              s.id === sessionId ? { ...s, totalTokensUsed } : s
             )
           );
         }
@@ -842,10 +909,99 @@ export function ChatPanel() {
           });
         });
       }
+
+      if (postAction === "archive") {
+        const archiveRes = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "archive" }),
+        });
+        const archiveJson = await archiveRes.json().catch(() => ({}));
+        if (!archiveRes.ok || !archiveJson.ok) {
+          throw new Error(archiveJson?.error?.message ?? "Failed to archive chat");
+        }
+      } else {
+        const deleteRes = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}`, {
+          method: "DELETE",
+        });
+        const deleteJson = await deleteRes.json().catch(() => ({}));
+        if (!deleteRes.ok || !deleteJson.ok) {
+          throw new Error(deleteJson?.error?.message ?? "Failed to delete chat");
+        }
+      }
+
+      setActiveAgent(null);
+      setStreamingText("");
+      setLastTurn(null);
+      setCurrent((prev) => (prev?.id === sessionId ? null : prev));
+      await refreshSessions();
+      await refreshArchivedSessions();
+      await refreshDeletedSessions();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSummarizing(false);
+      setSummarizeDialogOpen(false);
+    }
+  }
+
+  function openSummarizeDialog() {
+    if (!current || current.archived || summarizing) return;
+    setSummarizePostAction("archive");
+    setSummarizeDialogOpen(true);
+  }
+
+  async function deleteSession(id: string) {
+    if (streaming || deletingSessionId) return;
+    const target = sessions.find((s) => s.id === id);
+    const label = target?.title ?? id;
+    const confirmed = window.confirm(
+      `Move chat "${label}" to Deleted/? You can restore it from the vault later.`
+    );
+    if (!confirmed) return;
+    setDeletingSessionId(id);
+    setError(null);
+    try {
+      const res = await fetch(`/api/chat/sessions/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json.ok) {
+        throw new Error(json?.error?.message ?? "Failed to delete chat");
+      }
+      setActiveAgent(null);
+      setStreamingText("");
+      setLastTurn(null);
+      setCurrent((prev) => (prev?.id === id ? null : prev));
+      await refreshSessions();
+      await refreshDeletedSessions();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeletingSessionId(null);
+    }
+  }
+
+  async function restoreDeletedChat(deletedPath: string) {
+    if (streaming || deletingSessionId || restoringPath) return;
+    setRestoringPath(deletedPath);
+    setError(null);
+    try {
+      const res = await fetch("/api/chat/deleted", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deletedPath }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json.ok) {
+        throw new Error(json?.error?.message ?? "Failed to restore chat");
+      }
+      await refreshSessions();
+      await refreshDeletedSessions();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRestoringPath(null);
     }
   }
 
@@ -876,6 +1032,7 @@ export function ChatPanel() {
   const cacheHitPct =
     lastPrompt > 0 ? Math.round((lastCached / lastPrompt) * 100) : 0;
 
+  const isArchivedView = Boolean(current?.archived);
   const agentEnabled = Boolean(current?.agentEnabled);
   const webSearchEnabled = current?.webSearchEnabled !== false;
 
@@ -884,8 +1041,15 @@ export function ChatPanel() {
       <div className="min-h-0">
         <ChatSessionList
           sessions={sortedSessions}
+          archivedSessions={archivedSessions}
+          deletedSessions={deletedSessions}
           currentId={current?.id ?? null}
           onSelect={selectSession}
+          onSelectArchived={selectArchivedSession}
+          onDelete={(id) => void deleteSession(id)}
+          deletingId={deletingSessionId}
+          onRestore={(path) => void restoreDeletedChat(path)}
+          restoringPath={restoringPath}
           onCreate={() => void createSession()}
           sortMode={sortMode}
           onSortModeChange={setSortMode}
@@ -901,6 +1065,11 @@ export function ChatPanel() {
               <div className="truncate text-sm font-semibold">
                 {current?.title ?? "Discussion"}
               </div>
+              {isArchivedView ? (
+                <span className="rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-200">
+                  read-only
+                </span>
+              ) : null}
               {current?.model ? (
                 <span
                   className="rounded border border-bg-border bg-bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-ink-dim"
@@ -935,7 +1104,7 @@ export function ChatPanel() {
                   type="checkbox"
                   className="h-3 w-3 accent-sky-500"
                   checked={agentEnabled}
-                  disabled={togglingAgent || streaming}
+                  disabled={isArchivedView || togglingAgent || streaming}
                   onChange={(e) => void toggleAgent(e.target.checked)}
                 />
                 <span>Obsidian Vault</span>
@@ -950,7 +1119,7 @@ export function ChatPanel() {
                   type="checkbox"
                   className="h-3 w-3 accent-violet-500"
                   checked={webSearchEnabled}
-                  disabled={togglingWebSearch || streaming}
+                  disabled={isArchivedView || togglingWebSearch || streaming}
                   onChange={(e) => void toggleWebSearch(e.target.checked)}
                 />
                 <span>Web search</span>
@@ -1011,8 +1180,14 @@ export function ChatPanel() {
             <button
               type="button"
               className="btn"
-              onClick={summarize}
-              disabled={!current || streaming || messageList.length === 0 || summarizing}
+              onClick={openSummarizeDialog}
+              disabled={
+                !current ||
+                isArchivedView ||
+                streaming ||
+                messageList.length === 0 ||
+                summarizing
+              }
             >
               {summarizing ? (
                 <>
@@ -1120,13 +1295,15 @@ export function ChatPanel() {
                 onChange={(e) => setDraft(e.target.value)}
                 onKeyDown={onKeyDown}
                 placeholder={
-                  agentEnabled
+                  isArchivedView
+                    ? "Archived chat is read-only"
+                    : agentEnabled
                     ? "Ask anything… the assistant may run vault tools (⌘/Ctrl + Enter to send)"
                     : "Ask anything… (⌘/Ctrl + Enter to send)"
                 }
                 rows={2}
                 className="textarea resize-none"
-                disabled={streaming}
+                disabled={streaming || isArchivedView}
               />
               <div className="mt-1 flex items-center justify-between text-[11px] text-ink-dim">
                 <span>⌘/Ctrl + Enter to send</span>
@@ -1137,13 +1314,13 @@ export function ChatPanel() {
               <div className="flex gap-2">
                 <MicButton
                   onRecorded={handleRecordToText}
-                  disabled={streaming || transcribing}
+                  disabled={streaming || transcribing || isArchivedView}
                   idleLabel="To text"
                   idleTitle="Record → put transcript into the input box"
                 />
                 <MicButton
                   onRecorded={handleRecordAndSend}
-                  disabled={streaming || transcribing}
+                  disabled={streaming || transcribing || isArchivedView}
                   idleLabel="Send"
                   idleTitle="Record → transcribe → send immediately"
                   variant="primary"
@@ -1152,7 +1329,7 @@ export function ChatPanel() {
               <button
                 type="button"
                 className="btn-primary"
-                disabled={streaming || draft.trim().length === 0}
+                disabled={streaming || isArchivedView || draft.trim().length === 0}
                 onClick={() => sendMessage()}
               >
                 {streaming ? (
@@ -1168,6 +1345,61 @@ export function ChatPanel() {
           </div>
         </div>
       </div>
+      {summarizeDialogOpen && current ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="w-full max-w-md rounded-xl border border-bg-border bg-bg-panel p-4">
+            <div className="text-sm font-semibold text-ink">Summarize Chat</div>
+            <p className="mt-2 text-sm text-ink-dim">
+              We will generate a summary, send it to the Data Brain, then process this chat.
+            </p>
+            <div className="mt-3 space-y-2 text-sm">
+              <label className="flex items-center gap-2 text-ink">
+                <input
+                  type="radio"
+                  name="summarize-post-action"
+                  checked={summarizePostAction === "archive"}
+                  onChange={() => setSummarizePostAction("archive")}
+                />
+                Archive this chat (recommended, read-only later)
+              </label>
+              <label className="flex items-center gap-2 text-ink">
+                <input
+                  type="radio"
+                  name="summarize-post-action"
+                  checked={summarizePostAction === "delete"}
+                  onChange={() => setSummarizePostAction("delete")}
+                />
+                Delete this chat (move to Deleted/)
+              </label>
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                className="rounded-md border border-bg-border bg-bg px-3 py-1.5 text-sm text-ink hover:bg-bg-elevated"
+                onClick={() => setSummarizeDialogOpen(false)}
+                disabled={summarizing}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={() => void summarizeWithAction(summarizePostAction)}
+                disabled={summarizing}
+              >
+                {summarizing ? (
+                  <>
+                    <Spinner />
+                    Processing…
+                  </>
+                ) : (
+                  "Summarize and continue"
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1270,6 +1502,8 @@ function toolEntriesToSteps(messages: ChatMessage[]): AgentStep[] {
         callId: m.id,
         name: m.toolName ?? "?",
         args: m.args,
+        plannerModel: m.plannerModel,
+        finalModel: m.finalModel,
       };
       pending.push(step);
       out.push(step);

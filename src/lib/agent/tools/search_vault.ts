@@ -54,6 +54,8 @@ const RERANK_TRIGGER_STRONG_COUNT = 5;
 const RERANK_CANDIDATE_LIMIT = 10;
 /** How many near-titles we hand to the LLM as inspiration for a reformulation. */
 const REFORMULATION_SAMPLE_TITLES = 5;
+/** Timebox for reformulation step; skip if it is slow. */
+const REFORMULATION_TIMEOUT_MS = 1200;
 
 const REFORMULATE_SYSTEM_PROMPT = [
   "You help a vault search system recover from a near-miss query. The user",
@@ -106,7 +108,10 @@ export const searchVaultTool: AgentTool<z.infer<typeof ParamsSchema>, SearchVaul
     let layered = await search.searchLayered(input.query, { limit });
 
     if (layered.strong.length === 0 && layered.near.length > 0) {
-      const reformulation = await tryReformulate(input.query, layered.near).catch(
+      const reformulation = await timeBox(
+        tryReformulate(input.query, layered.near),
+        REFORMULATION_TIMEOUT_MS
+      ).catch(
         (err) => {
           ctx.logger.warn("search_vault: reformulation failed", {
             err: err instanceof Error ? err.message : String(err),

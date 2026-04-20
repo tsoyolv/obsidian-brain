@@ -31,8 +31,50 @@ const log = createLogger("vaultService");
 export const VAULT_FOLDERS = {
   notes: "Notes",
   aiChats: "AI Chats",
+  archivedChats: "Archived Chats",
   tasks: "Tasks",
+  data: "Data",
 } as const;
+
+const STARTUP_SEED_FILES: ReadonlyArray<{ relPath: string; content: string }> = [
+  {
+    relPath: `${VAULT_FOLDERS.tasks}/tasks.md`,
+    content: "# Tasks\n\n",
+  },
+  {
+    relPath: `${VAULT_FOLDERS.data}/Chats/.keep.md`,
+    content: "# Data Chats\n",
+  },
+  {
+    relPath: `${VAULT_FOLDERS.data}/Concepts/.keep.md`,
+    content: "# Data Concepts\n",
+  },
+  {
+    relPath: `${VAULT_FOLDERS.data}/Cases/.keep.md`,
+    content: "# Data Cases\n",
+  },
+  {
+    relPath: `${VAULT_FOLDERS.data}/Tasks/.keep.md`,
+    content: "# Data Tasks\n",
+  },
+  {
+    relPath: `${VAULT_FOLDERS.data}/Indexes/.keep.md`,
+    content: "# Data Indexes\n",
+  },
+  {
+    relPath: `${VAULT_FOLDERS.data}/Indexes/topics.md`,
+    content: "# Topics Index\n\n## Concepts\n\n- (none)\n\n## Cases\n\n- (none)\n",
+  },
+  {
+    relPath: `${VAULT_FOLDERS.data}/Indexes/chats.md`,
+    content: "# Chat Archives Index\n\n## Chats\n\n- (none)\n",
+  },
+  {
+    relPath: `${VAULT_FOLDERS.data}/Indexes/tasks.md`,
+    content:
+      "# Tasks Index\n\n## Task Sources\n\n- (none)\n\n## Task Archives\n\n- (none)\n\n## Data Snapshots\n\n- (none)\n",
+  },
+];
 
 export type VaultFolder = (typeof VAULT_FOLDERS)[keyof typeof VAULT_FOLDERS];
 
@@ -48,11 +90,15 @@ export type VaultFolder = (typeof VAULT_FOLDERS)[keyof typeof VAULT_FOLDERS];
 export const DELETED_FOLDER = "Deleted";
 
 /**
- * Allowlist of TOP-LEVEL vault folders that ANY mutating vault operation is
- * permitted to write into. Anything outside this set — including the vault
- * root itself or arbitrary user-supplied folders — is rejected at the
- * service boundary, so a misbehaving classifier or a buggy caller cannot
- * scribble into `.obsidian/`, attached subfolders, or unrelated trees.
+ * Allowlist of TOP-LEVEL first-class vault folders that ANY mutating vault
+ * operation is permitted to write into. It is derived automatically from
+ * {@link VAULT_FOLDERS}, so adding a new first-class folder (for example
+ * `Data/`) includes it here without extra wiring.
+ *
+ * Anything outside this set — including the vault root itself or arbitrary
+ * user-supplied folders — is rejected at the service boundary, so a
+ * misbehaving classifier or a buggy caller cannot scribble into `.obsidian/`,
+ * attached subfolders, or unrelated trees.
  *
  * `Deleted/` is INTENTIONALLY excluded: the only way to land a file there is
  * via {@link VaultService.softDelete}, which uses a private code path.
@@ -179,6 +225,15 @@ export interface VaultService {
    * a timestamp suffix is appended. NEVER unlinks the file from disk.
    */
   softDelete(relPath: string): Promise<SoftDeleteResult>;
+  /**
+   * Restore a file previously soft-deleted under `Deleted/` back into the
+   * writable vault tree. Destination collisions are resolved with timestamp
+   * suffixes when `uniqueOnConflict` is true.
+   */
+  restoreDeleted(
+    deletedRelPath: string,
+    options?: MoveFileOptions
+  ): Promise<MoveFileResult>;
 
   // Discovery
   /**
@@ -219,6 +274,7 @@ class VaultServiceImpl implements VaultService {
     for (const folder of Object.values(VAULT_FOLDERS)) {
       await ensureDir(this.resolve(folder));
     }
+    await this.ensureStartupScaffold();
   }
 
   async fileExists(relPath: string): Promise<boolean> {
@@ -411,6 +467,43 @@ class VaultServiceImpl implements VaultService {
     return { path: finalRel };
   }
 
+  async restoreDeleted(
+    deletedRelPath: string,
+    options: MoveFileOptions = {}
+  ): Promise<MoveFileResult> {
+    const safeDeleted = sanitizeRelPath(deletedRelPath);
+    const prefix = `${DELETED_FOLDER}${path.sep}`;
+    if (!safeDeleted.startsWith(prefix)) {
+      throw new Error(
+        `restoreDeleted expects a path under ${DELETED_FOLDER}/: ${deletedRelPath}`
+      );
+    }
+    const restoreRel = safeDeleted.slice(prefix.length);
+    this.assertWritablePath(restoreRel, "moveFile");
+
+    const srcAbs = this.resolve(safeDeleted);
+    if (!(await pathExists(srcAbs))) {
+      throw new Error(`Cannot restore; source not found: ${deletedRelPath}`);
+    }
+
+    let destAbs = this.resolve(restoreRel);
+    await ensureDir(path.dirname(destAbs));
+    if (await pathExists(destAbs)) {
+      if (!options.uniqueOnConflict) {
+        throw new Error(`Restore destination already exists: ${restoreRel}`);
+      }
+      destAbs = path.join(
+        path.dirname(destAbs),
+        withTimestampSuffix(path.basename(destAbs))
+      );
+    }
+
+    await move(srcAbs, destAbs);
+    const finalRel = toVaultRelative(this.root, destAbs);
+    log.info("restoreDeleted", { from: safeDeleted, to: finalRel });
+    return { path: finalRel };
+  }
+
   /**
    * Reject any mutating operation whose target path is not inside the
    * writable allowlist (or is inside `Deleted/`). Defense-in-depth on top
@@ -500,6 +593,21 @@ class VaultServiceImpl implements VaultService {
   /** Absolute path of the `Deleted/` subtree, used to prune walks at root. */
   private deletedSkipSet(): ReadonlySet<string> {
     return new Set([path.join(this.root, DELETED_FOLDER)]);
+  }
+
+  /**
+   * Startup "soft migration": create expected folders/files only when missing.
+   * Existing files are never overwritten.
+   */
+  private async ensureStartupScaffold(): Promise<void> {
+    for (const seed of STARTUP_SEED_FILES) {
+      const safeRel = sanitizeRelPath(seed.relPath);
+      const abs = this.resolve(safeRel);
+      await ensureDir(path.dirname(abs));
+      if (await pathExists(abs)) continue;
+      await writeUtf8(abs, ensureTrailingNewline(seed.content));
+      log.debug("ensureStartupScaffold: created", { path: safeRel });
+    }
   }
 }
 

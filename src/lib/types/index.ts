@@ -30,6 +30,10 @@ export interface ChatMessage {
   toolName?: string;
   /** Validated tool arguments; set on `tool_call` entries only. */
   args?: unknown;
+  /** Model used for tool planning / tool-calling on this step. */
+  plannerModel?: string;
+  /** Model used for final user-facing synthesis on this step's turn. */
+  finalModel?: string;
   /**
    * Tool result envelope (`{ ok, data | error }`); set on `tool_result`
    * entries only. Shape mirrors `ToolResult<unknown>` from the agent
@@ -263,3 +267,9 @@ export interface NoteFrontmatter {
   tags?: string[];
   [key: string]: unknown;
 }
+
+export type {
+  DataDocumentKind,
+  DataUpsertPolicy,
+} from "./dataKnowledge";
+export type { DataExtractionResult, DataLink } from "./dataKnowledge";

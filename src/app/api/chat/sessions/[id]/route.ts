@@ -10,6 +10,10 @@ const PatchSchema = z.object({
   webSearchEnabled: z.boolean().optional(),
 });
 
+const PostSchema = z.object({
+  action: z.enum(["archive"]),
+});
+
 /**
  * Returns a single chat session including the full message history rebuilt
  * from the vault transcript. The list endpoint omits messages to keep the
@@ -84,5 +88,38 @@ export async function PATCH(
     });
   } catch (err) {
     return handleError("PATCH /api/chat/sessions/[id]", err);
+  }
+}
+
+export async function DELETE(
+  _req: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id } = await params;
+    const chat = getChatService();
+    const result = await chat.deleteSession(id);
+    return ok({ id, deletedPath: result.deletedPath });
+  } catch (err) {
+    return handleError("DELETE /api/chat/sessions/[id]", err);
+  }
+}
+
+export async function POST(
+  req: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id } = await params;
+    const raw = (await req.json().catch(() => ({}))) as unknown;
+    const body = PostSchema.parse(raw ?? {});
+    const chat = getChatService();
+    if (body.action === "archive") {
+      const result = await chat.archiveSession(id);
+      return ok({ id, archivedPath: result.archivedPath });
+    }
+    return fail("Unknown action", 400);
+  } catch (err) {
+    return handleError("POST /api/chat/sessions/[id]", err);
   }
 }
