@@ -34,6 +34,7 @@ export async function GET(
       totalTokensUsed: session.totalTokensUsed ?? 0,
       nextPromptEstimateTokens: chat.estimateNextPromptTokens(session),
       tokenLimit: CHAT_TOKEN_LIMIT,
+      chatSummary: session.chatSummary,
     });
   } catch (err) {
     return handleError("GET /api/chat/sessions/[id]", err);
@@ -71,6 +72,7 @@ export async function PATCH(
       totalTokensUsed: session.totalTokensUsed ?? 0,
       nextPromptEstimateTokens: chat.estimateNextPromptTokens(session),
       tokenLimit: CHAT_TOKEN_LIMIT,
+      chatSummary: session.chatSummary,
     });
   } catch (err) {
     return handleError("PATCH /api/chat/sessions/[id]", err);

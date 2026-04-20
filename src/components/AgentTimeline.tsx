@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { ActionResultCard } from "./ActionResultCard";
+import { Markdown } from "./Markdown";
 import { Spinner, ThinkingDots } from "./Spinner";
 import type { ToolResult } from "@/lib/agent/types";
 
@@ -118,15 +119,29 @@ function Timeline({
 }) {
   return (
     <ol className="space-y-2">
-      {steps.map((step, i) => (
-        <li key={i}>
-          {step.kind === "tool_call" ? (
+      {steps.map((step, i) => {
+        if (step.kind === "message") {
+          return (
+            <li key={i}>
+              <MessageStep text={step.text} />
+            </li>
+          );
+        }
+        // For tool_calls, we keep the compact chip (tool name + args +
+        // status) so the agent's action trail stays scannable, AND —
+        // for tools whose whole point is to produce long-form content
+        // (summarize / answer / file read) — we surface that content
+        // as a first-class chat-bubble right underneath. This is what
+        // makes "summarize that note" feel like a reply instead of a
+        // debug artifact hidden behind an expand arrow.
+        const inline = extractInlineContent(step);
+        return (
+          <li key={i} className="space-y-2">
             <ToolStepChip step={step} />
-          ) : (
-            <MessageStep text={step.text} />
-          )}
-        </li>
-      ))}
+            {inline ? <MessageStep text={inline} /> : null}
+          </li>
+        );
+      })}
       {finalMessage && !lastStepIsMatchingMessage(steps, finalMessage) ? (
         <li>
           <MessageStep text={finalMessage} />
@@ -134,6 +149,43 @@ function Timeline({
       ) : null}
     </ol>
   );
+}
+
+/**
+ * Pull the "user-facing" markdown payload out of a finished tool call,
+ * if the tool is one whose result the user explicitly asked for
+ * (summaries, answers, confirmed file reads). Returns undefined when
+ * there's nothing to surface inline — the chip alone is enough.
+ *
+ * We DON'T re-check `step.confirmed` here: confirmation is enforced on
+ * the server (gated tools can't run without a valid token), so once
+ * we have `result.ok === true` the content is approved by definition.
+ * That matters for persisted turns too, where the client-side
+ * `confirmed` flag is lost on reload but the successful result isn't.
+ */
+function extractInlineContent(
+  step: Extract<AgentStep, { kind: "tool_call" }>
+): string | undefined {
+  const result = step.result;
+  if (!result || !result.ok) return undefined;
+  const data = (result as { ok: true; data: unknown }).data;
+  if (!data || typeof data !== "object") return undefined;
+  const obj = data as Record<string, unknown>;
+  if (step.name === "run_file_task") {
+    const md = obj.markdown;
+    return typeof md === "string" && md.trim().length > 0 ? md : undefined;
+  }
+  if (step.name === "read_confirmed_file") {
+    const content = obj.content;
+    return typeof content === "string" && content.trim().length > 0
+      ? content
+      : undefined;
+  }
+  if (step.name === "answer_from_vault") {
+    const ans = obj.answer;
+    return typeof ans === "string" && ans.trim().length > 0 ? ans : undefined;
+  }
+  return undefined;
 }
 
 function lastStepIsMatchingMessage(
@@ -147,8 +199,8 @@ function lastStepIsMatchingMessage(
 
 function MessageStep({ text }: { text: string }) {
   return (
-    <div className="rounded-2xl rounded-bl-md border border-bg-border bg-bg-elevated px-3 py-2 text-sm leading-relaxed text-ink whitespace-pre-wrap">
-      {text}
+    <div className="rounded-2xl rounded-bl-md border border-bg-border bg-bg-elevated px-3 py-2 text-sm leading-relaxed text-ink">
+      <Markdown text={text} />
     </div>
   );
 }

@@ -30,10 +30,7 @@ const log = createLogger("vaultService");
 
 export const VAULT_FOLDERS = {
   inbox: "Inbox",
-  voiceLogs: "Voice Logs",
-  captureLogs: "Capture Logs",
   aiChats: "AI Chats",
-  aiSummaries: "AI Summaries",
   tasks: "Tasks",
 } as const;
 

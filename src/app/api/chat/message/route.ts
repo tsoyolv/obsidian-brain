@@ -23,9 +23,7 @@ const BodySchema = z.object({
  *      `end` event. Frame payload:
  *        { delta: string, done: boolean, messageId: string, usage? }
  *
- *   2. Agent chat: one event per orchestrator {@link AgentEvent}, mirroring
- *      `/api/agent/capture` exactly so the UI can reuse its capture
- *      renderers:
+ *   2. Agent chat: one event per orchestrator {@link AgentEvent}:
  *        event: tool_call          data: { type, callId, name, args }
  *        event: tool_result        data: { type, callId, name, result }
  *        event: message_delta      data: { type, text }

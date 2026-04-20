@@ -10,11 +10,12 @@ const log = createLogger("api.transcribe");
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 
 /**
- * Transcribe-only endpoint: takes an audio blob, returns the recognized text.
- * Does NOT persist anything to the vault — used by the UI to populate the
- * draft input so the user can edit before sending. The Voice Log file is
- * written later, only when the (possibly edited) text is actually submitted
- * via POST /api/capture/text.
+ * Transcribe-only endpoint: takes an audio blob, returns the recognized
+ * text. Does NOT persist anything to the vault — used by the chat panel
+ * to populate the draft input so the user can edit before sending.
+ *
+ * Once submitted, the resulting message lands in the chat session's
+ * transcript under `AI Chats/`; there is no separate "voice log" file.
  */
 export async function POST(req: Request) {
   const t = log.time("POST /api/capture/transcribe");

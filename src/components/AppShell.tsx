@@ -1,9 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { CapturePanel } from "./CapturePanel";
 import { ChatPanel } from "./ChatPanel";
-import { TabSwitcher, type TabId } from "./TabSwitcher";
 
 interface RuntimeConfig {
   llmProvider: string;
@@ -15,7 +13,6 @@ interface RuntimeConfig {
 }
 
 export function AppShell() {
-  const [tab, setTab] = useState<TabId>("capture");
   const [config, setConfig] = useState<RuntimeConfig | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
 
@@ -54,7 +51,6 @@ export function AppShell() {
               </div>
             </div>
           </div>
-          <TabSwitcher current={tab} onChange={setTab} />
           <div className="text-right text-[11px] leading-tight text-ink-dim">
             {configError ? (
               <span className="text-red-400">{configError}</span>
@@ -80,7 +76,7 @@ export function AppShell() {
       </header>
 
       <main className="mx-auto w-full max-w-6xl flex-1 px-6 py-6">
-        {tab === "capture" ? <CapturePanel /> : <ChatPanel />}
+        <ChatPanel />
       </main>
 
       <footer className="border-t border-bg-border bg-bg-elevated/40">

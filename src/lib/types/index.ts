@@ -73,6 +73,28 @@ export interface ChatSession {
    * restart. Missing when no completion has been observed yet.
    */
   totalTokensUsed?: number;
+  /**
+   * User-facing "summary of this chat" generated on demand from the
+   * Summarize button. Unlike `summary` (which is a compaction aid for
+   * the next prompt), this one is for the human: it's pinned at the
+   * top of the chat UI and round-tripped through the transcript's
+   * frontmatter + a leading callout so it survives reloads and is
+   * visible in Obsidian too. Absent until the user asks for one.
+   */
+  chatSummary?: ChatSummary;
+}
+
+export interface ChatSummary {
+  /** Markdown body of the summary as produced by the summarizer. */
+  text: string;
+  /** Parsed action-item bullets (without the leading `- [ ]`). */
+  actionItems: string[];
+  /** ISO timestamp of when this summary was generated. */
+  generatedAt: string;
+  /** Provider id (e.g. "openai") that produced the summary. */
+  provider: string;
+  /** Concrete model id used. */
+  model: string;
 }
 
 export interface VoiceLogResult {

@@ -89,6 +89,12 @@ export interface SummaryResult {
    */
   provider: string;
   model: string;
+  /**
+   * Token usage for the summarization call itself. Surfaced so callers
+   * can attribute the spend to the chat's running `totalTokensUsed`
+   * counter — otherwise summarization would be an invisible cost.
+   */
+  usage?: ChatUsage;
 }
 
 // ---- File candidate ranking ----

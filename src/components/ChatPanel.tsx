@@ -15,7 +15,8 @@ import {
   type AgentTurnState,
   type PendingConfirmation,
 } from "./AgentTimeline";
-import type { ChatMessage } from "@/lib/types";
+import { Markdown } from "./Markdown";
+import type { ChatMessage, ChatSummary } from "@/lib/types";
 import type { ToolResult } from "@/lib/agent/types";
 
 interface SessionFull {
@@ -28,6 +29,7 @@ interface SessionFull {
   agentEnabled?: boolean;
   totalTokensUsed?: number;
   nextPromptEstimateTokens?: number;
+  chatSummary?: ChatSummary;
 }
 
 interface TurnUsage {
@@ -73,9 +75,6 @@ export function ChatPanel() {
   const [streamingText, setStreamingText] = useState("");
   const [activeAgent, setActiveAgent] = useState<ActiveAgentTurn | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [summary, setSummary] = useState<{ path: string; text: string } | null>(
-    null
-  );
   const [summarizing, setSummarizing] = useState(false);
   const [tokenLimit, setTokenLimit] = useState<number>(DEFAULT_TOKEN_LIMIT);
   const [lastTurn, setLastTurn] = useState<TurnUsage | null>(null);
@@ -84,7 +83,16 @@ export function ChatPanel() {
   const [transcribing, setTranscribing] = useState(false);
   const [togglingAgent, setTogglingAgent] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  // Points at the ChatSummaryCard when one is rendered. We scroll here
+  // after a fresh Summarize so the user actually sees the card appear
+  // at the top of a long chat (otherwise they just sit at the bottom
+  // next to the button and it looks like "nothing happened").
+  const summaryCardRef = useRef<HTMLDivElement | null>(null);
   const draftRef = useRef<HTMLTextAreaElement | null>(null);
+  // Guard so the auto-open-most-recent effect runs at most once per mount.
+  // Without this, switching to a different chat would race with the
+  // effect and snap us back to the freshest session on every refresh.
+  const autoOpenedRef = useRef(false);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -105,6 +113,22 @@ export function ChatPanel() {
   useEffect(() => {
     refreshSessions();
   }, [refreshSessions]);
+
+  // Auto-open the most recent chat once the session list first arrives.
+  // Sessions come pre-sorted by `updatedAt DESC` from the server, so
+  // `sessions[0]` is the freshest one. Runs at most once (`autoOpenedRef`)
+  // so navigating between chats afterwards is sticky.
+  useEffect(() => {
+    if (autoOpenedRef.current) return;
+    if (loadingSessions) return;
+    if (current) return;
+    if (sessions.length === 0) return;
+    autoOpenedRef.current = true;
+    void selectSession(sessions[0]!.id);
+    // selectSession is stable enough for our purposes; we deliberately
+    // don't include it to avoid re-running on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadingSessions, sessions, current]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -129,7 +153,6 @@ export function ChatPanel() {
       if (!json.ok) throw new Error(json.error?.message ?? "Failed");
       const session = json.data as SessionFull;
       setCurrent(session);
-      setSummary(null);
       setLastTurn(null);
       setActiveAgent(null);
       if (typeof json.data.tokenLimit === "number") {
@@ -160,7 +183,6 @@ export function ChatPanel() {
       totalTokensUsed: found.totalTokensUsed,
       nextPromptEstimateTokens: found.nextPromptEstimateTokens,
     });
-    setSummary(null);
     setLastTurn(null);
     setActiveAgent(null);
     setError(null);
@@ -174,6 +196,20 @@ export function ChatPanel() {
       setCurrent((prev) => (prev?.id === id ? full : prev));
       if (typeof json.data.tokenLimit === "number") {
         setTokenLimit(json.data.tokenLimit);
+      }
+      // If this chat already has a saved summary, jump straight to the
+      // summary card instead of dumping the user into the middle of a
+      // long transcript. Two rAFs so we wait for the messages list to
+      // render first (the card lives above it and needs layout).
+      if (full.chatSummary) {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            summaryCardRef.current?.scrollIntoView({
+              behavior: "auto",
+              block: "start",
+            });
+          });
+        });
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -450,6 +486,16 @@ export function ChatPanel() {
   function finalizeAgentTurn(assistantMessageId: string) {
     setActiveAgent((prev) => {
       if (!prev) return prev;
+      // If the stream ended with an outstanding confirmation request,
+      // DO NOT collapse the timeline yet — that would unmount the
+      // ActiveAgentBubble and the Confirm / Cancel buttons along with
+      // it, leaving the user with no way to answer the agent.
+      // `confirmActiveAgentTool` / `cancelActiveAgentTool` clear
+      // `pendingConfirmation` before they call us again, so on that
+      // second pass we'll fall through to the fold below.
+      if (prev.state.pendingConfirmation) {
+        return { ...prev, pending: false };
+      }
       const now = new Date().toISOString();
       const newMsgs: ChatMessage[] = [];
       for (const step of prev.state.steps) {
@@ -641,7 +687,58 @@ export function ChatPanel() {
       });
       const json = await res.json();
       if (!json.ok) throw new Error(json.error?.message ?? "Failed");
-      setSummary({ path: json.data.summaryPath, text: json.data.summary });
+      const chatSummary = json.data.chatSummary as ChatSummary | undefined;
+      const turnTokens =
+        typeof json.data.turnTokens === "number" ? json.data.turnTokens : undefined;
+      const totalTokensUsed =
+        typeof json.data.totalTokensUsed === "number"
+          ? json.data.totalTokensUsed
+          : undefined;
+      if (chatSummary) {
+        setCurrent((prev) =>
+          prev && prev.id === current.id
+            ? {
+                ...prev,
+                chatSummary,
+                ...(totalTokensUsed !== undefined ? { totalTokensUsed } : {}),
+              }
+            : prev
+        );
+        // Mirror the total into the sidebar entry so the list and the
+        // header agree immediately (sidebar otherwise only refreshes on
+        // the next /api/chat/sessions poll).
+        if (totalTokensUsed !== undefined) {
+          setSessions((prev) =>
+            prev.map((s) =>
+              s.id === current.id ? { ...s, totalTokensUsed } : s
+            )
+          );
+        }
+        // Surface the summarize spend in the same "last turn" pill the
+        // chat already uses for regular turns, so Summarize isn't an
+        // invisible cost.
+        if (turnTokens !== undefined) {
+          setLastTurn({
+            lastTurnTotalTokens: turnTokens,
+            sessionTotalTokens: totalTokensUsed ?? turnTokens,
+            nextPromptEstimateTokens:
+              lastTurn?.nextPromptEstimateTokens ??
+              current.nextPromptEstimateTokens ??
+              0,
+            limitTokens: lastTurn?.limitTokens ?? tokenLimit,
+          });
+        }
+        // Give React one frame to mount the card, then scroll it into
+        // view. Without this the summary lands at the top of a long
+        // scrollback and the user (who is down by the input) doesn't
+        // notice anything changed.
+        requestAnimationFrame(() => {
+          summaryCardRef.current?.scrollIntoView({
+            behavior: "smooth",
+            block: "start",
+          });
+        });
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -828,13 +925,27 @@ export function ChatPanel() {
               </div>
             </div>
           ) : messageList.length === 0 && !streamingText && !activeAgent ? (
-            <div className="text-sm text-ink-dim">
-              {agentEnabled
-                ? "Send the first message — this chat is agent-enabled, so the assistant can run vault tools (it will ask before reading or deleting files)."
-                : "Send the first message to begin. Responses are streamed and the transcript is saved into your vault."}
-            </div>
+            <>
+              {current?.chatSummary ? (
+                <ChatSummaryCard
+                  summary={current.chatSummary}
+                  cardRef={summaryCardRef}
+                />
+              ) : null}
+              <div className="text-sm text-ink-dim">
+                {agentEnabled
+                  ? "Send the first message — this chat is agent-enabled, so the assistant can run vault tools (it will ask before reading or deleting files)."
+                  : "Send the first message to begin. Responses are streamed and the transcript is saved into your vault."}
+              </div>
+            </>
           ) : (
             <>
+              {current?.chatSummary ? (
+                <ChatSummaryCard
+                  summary={current.chatSummary}
+                  cardRef={summaryCardRef}
+                />
+              ) : null}
               {renderMessageList(messageList)}
               {streaming && streamingText ? (
                 <MessageBubble role="assistant" content={streamingText} pending />
@@ -861,22 +972,6 @@ export function ChatPanel() {
             </>
           )}
         </div>
-
-        {summary ? (
-          <div className="border-t border-bg-border bg-bg p-4">
-            <div className="mb-1 flex items-center justify-between">
-              <div className="text-xs font-semibold uppercase tracking-wider text-ink-dim">
-                Summary saved
-              </div>
-              <div className="font-mono text-[11px] text-ink-dim">
-                {summary.path}
-              </div>
-            </div>
-            <div className="max-h-40 overflow-y-auto whitespace-pre-wrap rounded-md border border-bg-border bg-bg-elevated p-3 text-xs text-ink">
-              {summary.text}
-            </div>
-          </div>
-        ) : null}
 
         {error ? (
           <div className="border-t border-bg-border px-4 py-2">
@@ -1008,33 +1103,53 @@ function renderMessageList(messages: ChatMessage[]): React.ReactNode {
 }
 
 function toolEntriesToSteps(messages: ChatMessage[]): AgentStep[] {
-  const byCallId = new Map<string, AgentStep & { kind: "tool_call" }>();
+  // Pair tool_call → tool_result by ORDER (a result attaches to the
+  // closest preceding, same-toolName, still-unresolved call), not by
+  // `m.id`. We can't rely on id equality because:
+  //   * `finalizeAgentTurn` in this panel writes the result with id
+  //     `${callId}:result`, which intentionally differs from the call id;
+  //   * `chatService.sessionFromNote` assigns fresh `newId("msg")` to
+  //     every parsed transcript row on reload, so the original callIds
+  //     don't survive a round-trip through disk either.
+  // Order-based pairing is stable for both cases and also tolerates
+  // hand-edits that shuffle ids but preserve the call/result sequence.
   const out: AgentStep[] = [];
+  const pending: (AgentStep & { kind: "tool_call" })[] = [];
   for (const m of messages) {
     if (m.role === "tool_call") {
-      // Use the message id (orchestrator's callId) for re-association,
-      // falling back to the toolName + index when an older transcript
-      // didn't preserve a stable id.
-      const callId = m.id;
       const step: AgentStep & { kind: "tool_call" } = {
         kind: "tool_call",
-        callId,
+        callId: m.id,
         name: m.toolName ?? "?",
         args: m.args,
       };
-      byCallId.set(callId, step);
+      pending.push(step);
       out.push(step);
     } else if (m.role === "tool_result") {
-      const target = byCallId.get(m.id);
-      if (target) {
+      const name = m.toolName ?? "?";
+      // Prefer the most recent unresolved call with the same toolName,
+      // falling back to the most recent unresolved call of any name.
+      let idx = -1;
+      for (let i = pending.length - 1; i >= 0; i--) {
+        if (pending[i]!.name === name) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx === -1 && pending.length > 0) {
+        idx = pending.length - 1;
+      }
+      if (idx >= 0) {
+        const target = pending[idx]!;
         target.result = m.result as ToolResult<unknown>;
+        pending.splice(idx, 1);
       } else {
-        // Orphan result (call message dropped by hand-edits) — surface
-        // it as its own chip so the data isn't lost from the timeline.
+        // Truly orphan result (no preceding call at all) — surface it
+        // so the data isn't lost from the timeline.
         out.push({
           kind: "tool_call",
           callId: m.id,
-          name: m.toolName ?? "?",
+          name,
           args: undefined,
           result: m.result as ToolResult<unknown>,
         });
@@ -1042,6 +1157,73 @@ function toolEntriesToSteps(messages: ChatMessage[]): AgentStep[] {
     }
   }
   return out;
+}
+
+/**
+ * Sticky summary block pinned to the top of the chat transcript. The
+ * summary itself lives in the transcript's frontmatter (written by
+ * `chatService.summarize`) so it round-trips cleanly with the chat on
+ * disk and stays visible after a page reload. Collapsible so long
+ * summaries don't push the live conversation off-screen.
+ */
+function ChatSummaryCard({
+  summary,
+  cardRef,
+}: {
+  summary: ChatSummary;
+  cardRef?: React.MutableRefObject<HTMLDivElement | null>;
+}) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div
+      ref={cardRef}
+      className="rounded-xl border border-accent/50 bg-bg-panel p-3 ring-1 ring-accent/20"
+    >
+      <div className="mb-2 text-[10px] uppercase tracking-wider text-ink-dim">
+        Saved with this chat — visible after reload
+      </div>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 text-left"
+      >
+        <span className="pill border-accent/40 text-accent">Chat summary</span>
+        {summary.generatedAt ? (
+          <span className="text-[11px] text-ink-dim">
+            {formatSummaryTimestamp(summary.generatedAt)}
+          </span>
+        ) : null}
+        <span className="ml-auto text-[11px] text-ink-dim">
+          {open ? "▾" : "▸"}
+        </span>
+      </button>
+      {open ? (
+        <div className="mt-2 space-y-2 text-sm text-ink">
+          <Markdown text={summary.text} />
+          {summary.actionItems.length > 0 ? (
+            <div className="rounded-md border border-bg-border bg-bg/40 p-2">
+              <div className="mb-1 text-[10px] uppercase tracking-wider text-ink-dim">
+                Action items
+              </div>
+              <ul className="list-disc space-y-0.5 pl-5 text-sm">
+                {summary.actionItems.map((item, i) => (
+                  <li key={i} className="text-ink">
+                    {item}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function formatSummaryTimestamp(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString();
 }
 
 function PersistedAgentBubble({

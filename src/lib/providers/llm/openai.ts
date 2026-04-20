@@ -352,6 +352,7 @@ export class OpenAIChatProvider implements LLMProvider {
       actionItems: extractActionItems(markdown),
       provider: this.id,
       model: response.model,
+      usage: response.usage,
     };
   }
 }

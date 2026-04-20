@@ -1,6 +1,7 @@
 "use client";
 
 import type { ReactNode } from "react";
+import { Markdown } from "./Markdown";
 import type { ToolResult } from "@/lib/agent/types";
 import type {
   FileCandidate,
@@ -310,7 +311,9 @@ function renderAnswerFromVault(data: unknown): ReactNode {
   };
   return (
     <>
-      <div className="whitespace-pre-wrap text-sm text-ink">{d.answer}</div>
+      <div className="text-sm text-ink">
+        {d.answer ? <Markdown text={d.answer} /> : null}
+      </div>
       {d.sources && d.sources.length > 0 ? (
         <div className="mt-2 text-[11px] text-ink-dim">
           Sources:{" "}
@@ -336,9 +339,9 @@ function renderReadConfirmedFile(data: unknown, ctx: RendererCtx): ReactNode {
         <div className="mt-1 font-mono text-[11px] text-ink-dim">{d.path}</div>
       </div>
       {ctx.confirmed && d.content ? (
-        <pre className="mt-2 max-h-72 overflow-auto rounded-md border border-bg-border bg-bg p-2 text-xs text-ink">
-          {d.content}
-        </pre>
+        <div className="mt-2 max-h-72 overflow-auto rounded-md border border-bg-border bg-bg p-3 text-sm text-ink">
+          <Markdown text={d.content} />
+        </div>
       ) : (
         <div className="mt-2 text-[11px] text-ink-dim">
           File body hidden — confirmation required to display.
@@ -363,9 +366,9 @@ function renderRunFileTask(data: unknown, ctx: RendererCtx): ReactNode {
         ) : null}
       </div>
       {ctx.confirmed && d.markdown ? (
-        <pre className="mt-2 max-h-72 overflow-auto rounded-md border border-bg-border bg-bg p-2 text-xs text-ink">
-          {d.markdown}
-        </pre>
+        <div className="mt-2 max-h-72 overflow-auto rounded-md border border-bg-border bg-bg p-3 text-sm text-ink">
+          <Markdown text={d.markdown} />
+        </div>
       ) : (
         <div className="mt-2 text-[11px] text-ink-dim">
           Output hidden — confirmation required to display.

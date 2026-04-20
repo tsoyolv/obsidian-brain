@@ -2,32 +2,37 @@
 
 A local-first AI assistant integrated with your Obsidian vault.
 
-It runs as a tiny Next.js web app on your machine, captures text and voice
-input, classifies intent with an LLM, and writes everything as plain markdown
-into your vault. Long-form chat sessions stream into the same vault as
-transcripts and optional summaries.
+It runs as a tiny Next.js web app on your machine. The whole UI is a
+single chat surface: text or voice input on the right, your past chat
+sessions on the left. Every reply streams into a markdown transcript in
+your vault, and the assistant can call a small set of vault tools to
+search, save, edit, complete tasks, etc.
 
-> The LLM never has direct filesystem access. All vault mutations go through
-> a small set of explicit business actions (create note, append note, search
-> notes, create task, complete task, summarize chat).
+> The LLM never has direct filesystem access. All vault mutations go
+> through a small set of explicit business actions (create note, append
+> note, search notes, create task, complete task, summarize chat).
 
 ---
 
 ## Features
 
-- **Capture tab** – chat-style quick input
-  - typed text or recorded voice
-  - intents: save note, create task, complete task, search notes,
-    ask vault question, find file (name only), open file for task
-    (with confirmation)
-  - voice is transcribed and the raw transcript is saved immediately
-  - typed input is persisted as a raw capture log _before_ classification,
-    so nothing is lost if the LLM call fails
-- **Chat tab** – long-form AI conversations
-  - multiple in-memory sessions
+- **One unified chat surface**
+  - type or record voice; voice is transcribed locally into the input box
+    so you can edit before sending
+  - sessions sidebar on the left, freshest chat opens automatically
   - streaming assistant responses (SSE)
-  - every message persisted to a markdown transcript in the vault
-  - one-click summary + action items written to a separate markdown file
+  - every message persisted to a markdown transcript in `AI Chats/`
+  - one-click summary + action items stored inline in the chat's own
+    transcript (frontmatter on disk, pinned card at the top of the chat
+    in the UI) — no separate summary file is created
+- **Agent-by-default**
+  - new chats have the agent enabled out of the box; the assistant can
+    call vault tools (search, save note, create / complete task, find
+    file, open file with confirmation, soft-delete with confirmation)
+  - uncheck the `agent` toggle in the chat header to fall back to a plain
+    chat without tool access
+  - dangerous tools (read-confirmed-file, run-file-task, soft-delete)
+    always require an explicit user confirm in the UI
 - **Provider-agnostic core**
   - `LLMProvider` and `STTProvider` interfaces with OpenAI implementations
   - drop-in adapters for Anthropic, DeepSeek, local Whisper / Parakeet, etc.
@@ -55,11 +60,11 @@ folders exist inside your `OBSIDIAN_VAULT_PATH`:
 
 ```
 <vault>/
-├── Inbox/          # Saved notes from the Capture tab
-├── Voice Logs/     # Raw STT transcripts (one per recording)
-├── Capture Logs/   # Raw text captures (one per typed request)
+├── Inbox/          # Notes saved by the assistant via `save_note`
 ├── AI Chats/       # Full chat transcripts, one file per session
-├── AI Summaries/   # Optional summary + action items per chat
+│                   # Optional summary + action items live inline in
+│                   # each chat's YAML frontmatter (chat_summary,
+│                   # chat_summary_action_items) — no separate folder.
 └── Tasks/          # Task files (Inbox.md by default; daily / project files allowed)
 ```
 
@@ -113,9 +118,10 @@ npm run build && npm run start
 
 ## Usage
 
-### Capture tab
+When you open the app, the most recently updated chat opens automatically.
+Click **+ New chat** in the left sidebar to start a fresh one.
 
-Type something like:
+Type or record. Examples that exercise the agent's tools:
 
 - `save a note about today's planning meeting`
 - `create task buy milk tomorrow`
@@ -123,76 +129,59 @@ Type something like:
 - `search project alpha`
 - `what did I write about Postgres replication?`
 - `find file shopping list`
-- `open my reading list to add Dune`
+- `open my reading list and add Dune`
 
-Or click **Record**, speak, and click **Stop**. The recording is sent to
-the configured STT provider, the raw transcript is saved under
-`Voice Logs/`, and the transcript is then routed through the same intent
-classifier as typed text.
+For voice, click **To text** to put the transcript into the input box for
+editing, or **Send** to record → transcribe → submit in one step.
 
-Each capture shows an explicit action result:
+The assistant streams its reply into the chat. When the agent is enabled
+(default), it may chain multiple tool calls per turn; you'll see each call
+as a chip with a collapsible result. Reading or deleting a file always
+asks for explicit confirmation — file bodies are never loaded without
+your approval.
 
-- `Saved note "..."` (with the resulting vault path)
-- `Created task: "..."`
-- `Completed task: "..."`
-- `Found N matching notes` (with snippets)
-- `Found N files matching "..."` — for `find_file`, names only, no body read
-- `Found "<file>". Confirm to open it for "<task>".` — for `open_file_for_task`
-- `Need clarification: ...` when a task or file lookup is ambiguous
-
-### Capture pipeline
-
-Every typed request goes through four well-defined stages:
-
-1. **Input** — the user's raw string (typed or transcribed from voice).
-2. **Save raw note** — the input is written to `Capture Logs/<stamp>.md`
-   _before_ any LLM call, so nothing is lost on transient failures.
-3. **Classify intent** — the LLM is forced to return strict JSON shaped
-   `{ "intent": "...", "data": { ... } }`. The provider validates the JSON
-   against a per-intent zod schema; malformed responses are coerced to
-   `{ intent: "unknown" }`.
-4. **Execute** — the matching business action runs. The classifier and the
-   business layer are completely separate; the LLM has no filesystem access.
-
-#### Safety rules baked into the pipeline
-
-- **Never deletes files.** The vault module exposes no unlink API; the only
-  destructive operation is `softDelete`, which moves files into `Deleted/`.
-- **Never reads a full file without confirmation.**
-  - `find_file` walks the vault but only inspects file _names_; bodies are
-    never opened.
-  - `open_file_for_task` surfaces the matched file path and returns
-    `status: "needs_confirmation"`. The body is read only after a follow-up
-    confirmation from the user.
-  - `ask_vault_question` reads at most the first ~1500 characters of each of
-    the top-N keyword-matched notes — bounded partial reads only.
-
-### Chat tab
-
-- Click **New chat** to start a session. A markdown transcript is created
-  immediately under `AI Chats/`.
-- Type and send a message; the assistant response streams into the UI and
-  is appended to the transcript when complete.
-- Click **Summarize** to generate a markdown summary + action items file
-  under `AI Summaries/`, linked back to the source chat.
+Click **Summarize** in the chat header to generate a markdown summary +
+action items. The result is stored inline in the chat's own transcript
+(under `chat_summary`/`chat_summary_action_items` in the frontmatter)
+and rendered as a pinned card at the top of the chat, so it survives
+page reloads and is visible both in the app and when opening the `.md`
+file in Obsidian.
 
 > Sessions are kept in memory for the dev server's lifetime. Markdown
-> transcripts are durable.
+> transcripts in `AI Chats/` are the durable record; on restart, the
+> session list is rebuilt by scanning that folder.
+
+### Safety rules baked into the agent loop
+
+- **Never deletes files.** The vault module exposes no unlink API; the
+  only destructive operation is `softDelete`, which moves files into
+  `Deleted/` — and even that requires a user confirmation.
+- **Never reads a full file without confirmation.**
+  - `find_file` walks the vault but only inspects file _names_; bodies
+    are never opened.
+  - `propose_open_file` / `read_confirmed_file` surface the matched file
+    path and stop with `needs_confirmation`. The body is read only after
+    the user clicks Confirm.
+  - `answer_from_vault` reads at most the first ~1500 characters of each
+    of the top-N keyword-matched notes — bounded partial reads only.
 
 ---
 
 ## API
 
-| Method | Path                       | Description                              |
-| ------ | -------------------------- | ---------------------------------------- |
-| POST   | `/api/capture/text`        | Classify + execute a typed capture       |
-| POST   | `/api/capture/voice`       | Transcribe audio and save raw voice log  |
-| GET    | `/api/search?q=...`        | Keyword search across vault markdown     |
-| POST   | `/api/chat/sessions`       | Create a chat session                    |
-| GET    | `/api/chat/sessions`       | List in-memory sessions                  |
-| POST   | `/api/chat/message`        | Send user message; SSE-streamed reply    |
-| POST   | `/api/chat/summarize`      | Save a summary + action items markdown   |
-| GET    | `/api/config/runtime`      | Sanitized runtime config (no secrets)    |
+| Method | Path                                | Description                                          |
+| ------ | ----------------------------------- | ---------------------------------------------------- |
+| POST   | `/api/capture/transcribe`           | Audio → text (no vault writes; used by chat input)   |
+| GET    | `/api/search?q=...`                 | Keyword search across vault markdown                 |
+| POST   | `/api/chat/sessions`                | Create a chat session                                |
+| GET    | `/api/chat/sessions`                | List sessions (rebuilt from `AI Chats/` on restart)  |
+| GET    | `/api/chat/sessions/:id`            | Full session incl. messages                          |
+| PATCH  | `/api/chat/sessions/:id`            | Toggle `agentEnabled` for a session                  |
+| POST   | `/api/chat/message`                 | Send user message; SSE-streamed reply                |
+| POST   | `/api/chat/confirm`                 | Confirm a pending agent tool call                    |
+| POST   | `/api/chat/cancel`                  | Cancel a pending agent tool call                     |
+| POST   | `/api/chat/summarize`               | Generate a chat summary; stored inline in the chat   |
+| GET    | `/api/config/runtime`               | Sanitized runtime config (no secrets)                |
 
 All non-streaming endpoints return:
 
@@ -230,14 +219,17 @@ src/
 │   └── globals.css
 ├── components/             # React UI (Tailwind)
 │   ├── AppShell.tsx
-│   ├── TabSwitcher.tsx
-│   ├── CapturePanel.tsx
 │   ├── ChatPanel.tsx
 │   ├── ChatSessionList.tsx
+│   ├── AgentTimeline.tsx
 │   ├── MessageBubble.tsx
 │   ├── MicButton.tsx
-│   └── ActionResultCard.tsx
+│   ├── ActionResultCard.tsx
+│   ├── Spinner.tsx
+│   └── TranscriptionCard.tsx
 └── lib/
+    ├── agent/              # Tool registry + orchestrator + agent session
+    │   └── tools/          # One file per tool (save_note, search_vault, …)
     ├── api/                # API helpers (responses, error formatting)
     ├── config/             # Typed env config
     ├── markdown/           # Frontmatter + helper renderers
@@ -245,13 +237,14 @@ src/
     │   ├── llm/            # LLMProvider interface + OpenAI impl + factory
     │   └── stt/            # STTProvider interface + OpenAI impl + factory
     ├── services/
-    │   ├── vaultService.ts # All filesystem mutations
-    │   ├── taskService.ts  # Markdown task CRUD + fuzzy completion
-    │   ├── searchService.ts
-    │   ├── captureService.ts
-    │   └── chatService.ts
+    │   ├── vault/          # All filesystem mutations (sole `node:fs` site)
+    │   ├── task/           # Markdown task CRUD + fuzzy completion
+    │   ├── search/         # Keyword + heading search
+    │   ├── chat/           # Sessions, transcripts, rolling-summary compaction
+    │   ├── fileCandidate/  # File-pick candidates (open-file flow)
+    │   └── fileTask/       # Confirmation-gated file edits
     ├── types/              # Shared domain types
-    └── utils/              # path safety, filenames, ids, logger
+    └── utils/              # path safety, filenames, ids, logger, tokens
 ```
 
 ### Adding a new LLM provider
@@ -266,19 +259,18 @@ The same pattern applies to `STTProvider`.
 
 ### Safety model
 
-- The LLM only ever sees text. It cannot call functions or touch the disk.
-- The capture service translates LLM output into one of a fixed set of
-  business actions:
-  - `vaultService.createNote`
-  - `vaultService.appendToNote`
-  - `taskService.createTask`
-  - `taskService.completeTask`
-  - `searchService.search`
-  - `chatService.summarize`
-- All filesystem paths are resolved through `safePathResolve`, which rejects
-  any path that escapes the vault root.
-- Filenames are sanitized to remove path separators, control characters and
-  characters illegal on Windows/macOS.
+- The LLM only ever sees text and emits a structured tool call. It cannot
+  touch the disk directly.
+- The orchestrator maps each tool name to one of a fixed set of business
+  actions (registered in `src/lib/agent/tools/`). Each action goes
+  through `vaultService` / `taskService` / `searchService` / `chatService`.
+- Confirmation-gated tools (`read_confirmed_file`, `run_file_task`,
+  `soft_delete`) yield a `needs_confirmation` event and STOP. They run
+  only after the user clicks Confirm in the UI.
+- All filesystem paths are resolved through `safePathResolve`, which
+  rejects any path that escapes the vault root.
+- Filenames are sanitized to remove path separators, control characters
+  and characters illegal on Windows/macOS.
 - Voice uploads are capped at 25 MB.
 
 #### Filesystem-level safety enforcement
@@ -307,10 +299,9 @@ can violate them, even by accident:
    `ensureNoteExists`, `appendToNote`, `writeRawNote`, `replaceLine`,
    `updateFrontmatter`, `moveFile`, `softDelete`) checks the target's
    top-level segment against `WRITABLE_FOLDERS`:
-   `Inbox`, `Voice Logs`, `Capture Logs`, `AI Chats`, `AI Summaries`,
-   `Tasks`. Writes to the vault root, to `Deleted/`, to `.obsidian/`, or
-   to any other arbitrary folder are rejected with a loud error before
-   any I/O happens.
+   `Inbox`, `AI Chats`, `Tasks`. Writes to the vault
+   root, to `Deleted/`, to `.obsidian/`, or to any other arbitrary
+   folder are rejected with a loud error before any I/O happens.
 
 ---
 

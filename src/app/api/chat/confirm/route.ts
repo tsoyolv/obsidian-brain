@@ -16,11 +16,9 @@ const BodySchema = z.object({
 /**
  * SSE-streamed confirmation endpoint for agent-enabled chat sessions.
  *
- * Mirrors `/api/agent/capture` (confirm shape) so the frontend can route
- * confirmation acknowledgements through a single helper. Yields one event
- * per orchestrator {@link AgentEvent} plus a terminal `done` event with
- * the per-turn usage so the chat budget stays in sync after gated tools
- * complete.
+ * Yields one event per orchestrator {@link AgentEvent} plus a terminal
+ * `done` event with the per-turn usage so the chat budget stays in sync
+ * after gated tools complete.
  */
 export async function POST(req: Request) {
   let body: z.infer<typeof BodySchema>;

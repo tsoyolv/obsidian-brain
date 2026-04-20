@@ -9,7 +9,12 @@ import { compactLocalStamp, newId, nowIso } from "@/lib/utils/id";
 import { ensureMarkdownExt } from "@/lib/utils/filenames";
 import { createLogger } from "@/lib/utils/logger";
 import { estimateTokensForMessages } from "@/lib/utils/tokens";
-import type { ChatMessage, ChatSession, NoteFrontmatter } from "@/lib/types";
+import type {
+  ChatMessage,
+  ChatSession,
+  ChatSummary,
+  NoteFrontmatter,
+} from "@/lib/types";
 import type { ParsedNote } from "@/lib/services/vault";
 import { getChatSessionStore } from "./sessionStore";
 import {
@@ -75,9 +80,20 @@ export interface AppendMessageInput {
 }
 
 export interface SummaryResult {
-  summaryPath: string;
-  summary: string;
-  actionItems: string[];
+  /** Full {@link ChatSummary} persisted into this chat's transcript. */
+  chatSummary: ChatSummary;
+  /**
+   * Tokens spent on THIS summarize call alone (as reported by the
+   * provider; estimated when unavailable). Exposed so the UI can show
+   * a toast / turn-token pill the same way regular chat turns do.
+   */
+  turnTokens: number;
+  /**
+   * Cumulative chat token usage AFTER this summarize was attributed to
+   * it. Mirrors {@link ChatSession.totalTokensUsed} and lets the client
+   * update its counter without needing a full session refetch.
+   */
+  totalTokensUsed: number;
 }
 
 /**
@@ -335,6 +351,8 @@ class ChatServiceImpl implements ChatService {
     const agentEnabled =
       typeof data.agent_enabled === "boolean" ? data.agent_enabled : undefined;
 
+    const chatSummary = parseChatSummaryFrontmatter(data);
+
     return {
       id,
       title,
@@ -346,6 +364,7 @@ class ChatServiceImpl implements ChatService {
       summary,
       summaryUpTo,
       totalTokensUsed,
+      chatSummary,
     };
   }
 
@@ -508,6 +527,16 @@ class ChatServiceImpl implements ChatService {
     if (session.agentEnabled !== undefined) {
       patch.agent_enabled = session.agentEnabled;
     }
+    if (session.chatSummary) {
+      // User-requested chat summary lives in this chat's OWN transcript
+      // frontmatter — we deliberately don't spill it to `AI Summaries/`
+      // anymore so each chat is self-contained on disk.
+      patch.chat_summary = session.chatSummary.text;
+      patch.chat_summary_action_items = session.chatSummary.actionItems;
+      patch.chat_summary_generated_at = session.chatSummary.generatedAt;
+      patch.chat_summary_provider = session.chatSummary.provider;
+      patch.chat_summary_model = session.chatSummary.model;
+    }
     try {
       await this.vault.updateFrontmatter(session.transcriptPath, patch);
     } catch (err) {
@@ -526,7 +555,11 @@ class ChatServiceImpl implements ChatService {
     const now = nowIso();
     const title = (input?.title ?? `Chat ${compactLocalStamp()}`).trim() || "Chat";
 
-    const agentEnabled = input?.agentEnabled === true ? true : false;
+    // Agent routing is the default surface in the unified UI: every new
+    // chat gets vault tools out of the box. Callers can still pass
+    // `agentEnabled: false` explicitly to opt out (and existing chats
+    // keep whatever value is in their transcript frontmatter).
+    const agentEnabled = input?.agentEnabled === false ? false : true;
 
     const session: ChatSession = {
       id,
@@ -1109,41 +1142,46 @@ class ChatServiceImpl implements ChatService {
       throw err;
     }
 
-    const stamp = compactLocalStamp();
-    const filename = ensureMarkdownExt(`${stamp} ${session.title}`);
-    const body =
-      `> Source chat: [[${stripMdExt(session.transcriptPath ?? "")}]]\n\n` +
-      result.markdown;
+    const chatSummary: ChatSummary = {
+      text: result.markdown,
+      actionItems: result.actionItems,
+      generatedAt: nowIso(),
+      provider: result.provider,
+      model: result.model,
+    };
+    session.chatSummary = chatSummary;
 
-    const created = await this.vault.createNote({
-      folder: VAULT_FOLDERS.aiSummaries,
-      title: filename,
-      content: body,
-      metadata: {
-        type: "ai-summary",
-        chat_id: session.id,
-        chat_title: session.title,
-        created: nowIso(),
-        provider: result.provider,
-        model: result.model,
-        source_chat: session.transcriptPath,
-        action_items: result.actionItems,
-      },
-      uniqueOnConflict: true,
-    });
+    // Attribute the summarization call's token spend to this chat's
+    // running counter — otherwise Summarize would be a silent cost.
+    // Falls back to a local estimate if the provider didn't report
+    // usage (same policy as regular chat turns).
+    const summaryTurnTokens =
+      result.usage?.totalTokens ??
+      estimateTokensForMessages(
+        session.messages.map((m) => ({
+          role: m.role === "tool_call" || m.role === "tool_result" ? "system" : m.role,
+          content: m.content,
+        }))
+      ) + estimateTokensForMessages([{ role: "assistant", content: result.markdown }]);
+    session.totalTokensUsed = (session.totalTokensUsed ?? 0) + summaryTurnTokens;
+    session.updatedAt = chatSummary.generatedAt;
+
+    this.store.put(session, this.store.getSystemPrompt(sessionId) ?? "");
+    await this.persistSessionState(session);
 
     t.done("summarize", {
       sessionId,
-      path: created.path,
       actionItems: result.actionItems.length,
       summaryChars: result.markdown.length,
       provider: result.provider,
       model: result.model,
+      summaryTurnTokens,
+      sessionTotalTokens: session.totalTokensUsed,
     });
     return {
-      summaryPath: created.path,
-      summary: result.markdown,
-      actionItems: result.actionItems,
+      chatSummary,
+      turnTokens: summaryTurnTokens,
+      totalTokensUsed: session.totalTokensUsed,
     };
   }
 }
@@ -1184,6 +1222,34 @@ function stringifyCompact(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+/**
+ * Pull the persisted {@link ChatSummary} back out of a transcript's
+ * frontmatter (written by {@link ChatServiceImpl.persistSessionState}).
+ * Tolerant of legacy chats that never had a summary — returns undefined
+ * when either the body text or the generation timestamp is missing.
+ */
+function parseChatSummaryFrontmatter(
+  data: Record<string, unknown>
+): ChatSummary | undefined {
+  const text = data.chat_summary;
+  if (typeof text !== "string" || text.trim().length === 0) return undefined;
+  const actionItemsRaw = data.chat_summary_action_items;
+  const actionItems = Array.isArray(actionItemsRaw)
+    ? actionItemsRaw.filter((v): v is string => typeof v === "string")
+    : [];
+  const generatedAt =
+    typeof data.chat_summary_generated_at === "string"
+      ? data.chat_summary_generated_at
+      : "";
+  const provider =
+    typeof data.chat_summary_provider === "string"
+      ? data.chat_summary_provider
+      : "";
+  const model =
+    typeof data.chat_summary_model === "string" ? data.chat_summary_model : "";
+  return { text, actionItems, generatedAt, provider, model };
 }
 
 /**
